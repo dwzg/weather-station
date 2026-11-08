@@ -30,7 +30,8 @@ class WifiLink {
   const char* pass_ = nullptr;
   State state_ = State::Down;
   uint32_t stateMs_ = 0;
-  uint32_t nextTryMs_ = 0;
+  uint32_t downAtMs_ = 0;  // retry waitMs_ after this (elapsed-time form: safe across millis() wrap)
+  uint32_t waitMs_ = 0;
   uint32_t lastRoamCheckMs_ = 0;
   uint32_t weakSinceMs_ = 0;
   ws::Backoff backoff_{5000, 5UL * 60 * 1000};

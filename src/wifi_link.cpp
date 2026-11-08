@@ -67,7 +67,8 @@ void WifiLink::loop(bool quiet) {
         stats_.downSinceMs = now;
         logf("wifi: link lost after %lus", static_cast<unsigned long>((now - stats_.upSinceMs) / 1000));
         state_ = State::Down;
-        nextTryMs_ = now + 1000;
+        downAtMs_ = now;
+        waitMs_ = 1000;
         return;
       }
       if (WiFi.RSSI() < kWeakRssi) {
@@ -99,7 +100,8 @@ void WifiLink::loop(bool quiet) {
         WiFi.disconnect(false);
         state_ = State::Down;
         const uint32_t wait = backoff_.next(os_random());
-        nextTryMs_ = now + wait;
+        downAtMs_ = now;
+        waitMs_ = wait;
         logf("wifi: join timed out (status %d), next try in %lus", static_cast<int>(WiFi.status()),
              static_cast<unsigned long>(wait / 1000));
       }
@@ -108,9 +110,10 @@ void WifiLink::loop(bool quiet) {
     case State::Down:
       if (linked) {  // came back by itself
         state_ = State::Joining;
+        stateMs_ = now;
         return;
       }
-      if (quiet || static_cast<int32_t>(now - nextTryMs_) < 0) return;
+      if (quiet || now - downAtMs_ < waitMs_) return;
       joinBest(false);
       state_ = State::Joining;
       stateMs_ = millis();

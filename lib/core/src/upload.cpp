@@ -11,7 +11,11 @@ namespace ws {
 Outcome classifyResponse(int s) {
   if (s >= 200 && s < 300) return Outcome::Accepted;
   if (s == 400 || s == 422) return Outcome::Rejected;
-  if (s == 401 || s == 403 || s == 404 || s == 405) return Outcome::Halt;
+  // Redirects (e.g. a trailing-slash 307), auth, wrong path or media type:
+  // retrying cannot help, a person has to fix the URL, key or app.
+  if ((s >= 300 && s < 400) || s == 401 || s == 403 || s == 404 || s == 405 || s == 413 || s == 415) {
+    return Outcome::Halt;
+  }
   return Outcome::Retry;  // <= 0 (no connection, TLS, timeout), 408, 429, 5xx, anything unexpected
 }
 

@@ -48,6 +48,15 @@ void Sensors::recoverBus() {
 }
 
 bool Sensors::initBme280() {
+  // The library's begin() waits for the calibration copy without a timeout, and
+  // on a bus that fails mid-way it would wait forever. Check the bus answers
+  // with the right chip first; the loop watchdog in main.cpp covers the rest.
+  Wire.beginTransmission(cfg::kBme280Addr);
+  Wire.write(0xD0);  // chip id register
+  if (Wire.endTransmission() != 0 || Wire.requestFrom(cfg::kBme280Addr, static_cast<uint8_t>(1)) != 1 ||
+      Wire.read() != 0x60) {
+    return false;
+  }
   if (!bme.begin(cfg::kBme280Addr, &Wire)) return false;
   // Forced mode: the sensor sleeps between readings, so it does not warm itself
   // up (the datasheet's "weather monitoring" setting, with more oversampling).
@@ -162,5 +171,5 @@ void Sensors::maybeDeCondense() {
   int32_t t, h;
   // 110 mW for 1 s, then the sensor measures (that reading is discarded: it is hot).
   // Five minutes until the next slot is plenty for it to cool down again.
-  if (readSht4x(kShtHeat110mW1s, 1100, t, h)) ++st_.heaterPulses;
+  if (readSht4x(kShtHeat110mW1s, 1200, t, h)) ++st_.heaterPulses;
 }

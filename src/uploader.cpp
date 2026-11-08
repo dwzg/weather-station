@@ -2,6 +2,7 @@
 
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WiFi.h>
+#include <StackThunk.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <time.h>
 
@@ -15,43 +16,66 @@
 #endif
 
 namespace {
-BearSSL::Session tlsSession;  // resumption makes every connection after the first cheap
+// The slowest single request (DNS, connect, handshake, headers, body, each with
+// its own timeout) takes about a minute. Never start one later than this before
+// the next slot, so an upload cannot push a measurement out of its window.
+constexpr uint32_t kStopBeforeSlotS = 70;
+constexpr uint32_t kStartAfterSlotS = 3;
+// After this many rejected readings in a row the app is more likely broken than
+// the readings: stop dropping them and wait for a person.
+constexpr uint8_t kRejectsBeforeHalt = 3;
 
 uint32_t secondsToNextSlot() {
   const time_t now = time(nullptr);
   return cfg::kSlotS - static_cast<uint32_t>(now % cfg::kSlotS);
 }
+bool inUploadWindow() {
+  const uint32_t s = secondsToNextSlot();
+  return s >= kStopBeforeSlotS && s <= cfg::kSlotS - kStartAfterSlotS;
+}
 }  // namespace
 
 uint32_t Uploader::retryInMs() const {
-  const int32_t d = static_cast<int32_t>(nextMs_ - millis());
-  return d > 0 ? static_cast<uint32_t>(d) : 0;
+  if (!paused_) return 0;
+  const uint32_t gone = millis() - pausedAtMs_;
+  return gone < pauseMs_ ? pauseMs_ - gone : 0;
 }
 
-void Uploader::scheduleRetry(uint32_t ms) { nextMs_ = millis() + ms; }
+void Uploader::pause(uint32_t ms) {
+  paused_ = true;
+  pausedAtMs_ = millis();
+  pauseMs_ = ms;
+}
 
 void Uploader::loop(bool wifiUp, bool timeValid) {
   if (!q_ || !wifiUp || !timeValid || q_->pending() == 0) return;
-  if (static_cast<int32_t>(millis() - nextMs_) < 0) return;
-  if (secondsToNextSlot() < 5 || secondsToNextSlot() > cfg::kSlotS - 3) return;  // keep slot boundaries free
+  if (paused_) {
+    if (millis() - pausedAtMs_ < pauseMs_) return;
+    paused_ = false;
+  }
+  if (!inUploadWindow()) return;
   sendBatch();
 }
 
 void Uploader::sendBatch() {
-  if (ESP.getMaxFreeBlockSize() < cfg::kMinHeapBlockForTls) {
-    snprintf(st_.lastError, sizeof st_.lastError, "heap too fragmented (%lu)",
-             static_cast<unsigned long>(ESP.getMaxFreeBlockSize()));
+  // Built per batch so the parsed roots do not sit on the heap between uploads.
+  BearSSL::X509List anchors(kTrustAnchors);
+  // The TLS client needs ~22 KB on top (8.5 KB buffers, ~6.5 KB contexts, the
+  // 6 KB BearSSL stack). Its x509 context aborts if it cannot be allocated,
+  // so check before trying rather than crash.
+  if (ESP.getFreeHeap() < 26000 || ESP.getMaxFreeBlockSize() < 10000) {
+    snprintf(st_.lastError, sizeof st_.lastError, "low memory (free %lu, block %lu)",
+             static_cast<unsigned long>(ESP.getFreeHeap()), static_cast<unsigned long>(ESP.getMaxFreeBlockSize()));
     logf("upload: %s", st_.lastError);
-    scheduleRetry(backoff_.next(os_random()));
+    pause(backoff_.next(os_random()));
     return;
   }
 
-  // Built per batch so the parsed roots do not sit on the heap between uploads.
-  BearSSL::X509List anchors(kTrustAnchors);
   BearSSL::WiFiClientSecure client;
   client.setTrustAnchors(&anchors);
-  client.setSession(&tlsSession);
-  client.setBufferSizes(16384, 1024);  // the server does not do max-fragment negotiation
+  // The server's largest TLS record is the certificate chain, 4.3 KB (measured
+  // 2026-11-08); responses are a few hundred bytes. 8 KB halves the buffer.
+  client.setBufferSizes(8192, 1024);
   client.setX509Time(time(nullptr));
   client.setTimeout(cfg::kHttpTimeoutMs);
 
@@ -63,9 +87,9 @@ void Uploader::sendBatch() {
   const uint32_t started = millis();
   uint32_t sent = 0;
   bool failed = false;
+  bool halted = false;
   ws::Reading r;
-  while (sent < cfg::kBatchMax && millis() - started < cfg::kBatchBudgetMs && secondsToNextSlot() >= 5 &&
-         q_->front(r)) {
+  while (sent < cfg::kBatchMax && millis() - started < cfg::kBatchBudgetMs && inUploadWindow() && q_->front(r)) {
     char body[192];
     if (!ws::buildBody(r, cal_, body, sizeof body)) {
       logf("upload: cannot encode reading %lu, dropping it", static_cast<unsigned long>(r.epoch));
@@ -75,44 +99,48 @@ void Uploader::sendBatch() {
     }
     if (!http.begin(client, API_URL)) {
       snprintf(st_.lastError, sizeof st_.lastError, "bad API_URL");
-      failed = true;
+      halted = true;
       break;
     }
     http.addHeader(F("Content-Type"), F("application/json"));
     http.addHeader(F("X-API-Key"), F(API_KEY));
     const int code = http.POST(reinterpret_cast<uint8_t*>(body), strlen(body));
     st_.lastStatus = code;
+    const uint32_t heap = ESP.getFreeHeap();
+    if (!st_.minHeapInTls || heap < st_.minHeapInTls) st_.minHeapInTls = heap;
     String resp = code > 0 ? http.getString() : String();
 
-    switch (ws::classifyResponse(code)) {
+    ws::Outcome outcome = ws::classifyResponse(code);
+    if (outcome == ws::Outcome::Rejected && rejectsInARow_ + 1 >= kRejectsBeforeHalt) {
+      outcome = ws::Outcome::Halt;  // keep this one and everything behind it
+    }
+    switch (outcome) {
       case ws::Outcome::Accepted:
         q_->pop();
         ++sent;
         ++st_.accepted;
+        rejectsInARow_ = 0;
         st_.lastOkEpoch = static_cast<uint32_t>(time(nullptr));
         st_.lastError[0] = '\0';
         continue;
       case ws::Outcome::Rejected:
-        logf("upload: app rejected %s -> %d %.60s", body, code, resp.c_str());
+        logf("upload: app rejected %.90s -> %d %.60s", body, code, resp.c_str());
         q_->pop();
         ++st_.rejected;
+        ++rejectsInARow_;
         continue;
       case ws::Outcome::Halt:
-        snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d, check API_URL/API_KEY", code);
-        logf("upload: %s; pausing %lu min", st_.lastError, static_cast<unsigned long>(cfg::kHaltMs / 60000));
-        q_->commit();
-        http.end();
-        scheduleRetry(cfg::kHaltMs);
-        ++st_.failedBatches;
-        return;
+        snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d %.40s", code, resp.c_str());
+        halted = true;
+        break;
       case ws::Outcome::Retry:
         if (code > 0) {
           snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d", code);
         } else {
-          char tls[48] = "";
+          char tls[40] = "";
           const int tlsErr = client.getLastSSLError(tls, sizeof tls);
           if (tlsErr) {
-            snprintf(st_.lastError, sizeof st_.lastError, "TLS %d: %.40s", tlsErr, tls);
+            snprintf(st_.lastError, sizeof st_.lastError, "TLS %d: %s", tlsErr, tls);
           } else {
             snprintf(st_.lastError, sizeof st_.lastError, "%s", HTTPClient::errorToString(code).c_str());
           }
@@ -125,13 +153,24 @@ void Uploader::sendBatch() {
   http.end();
   client.stop();
   q_->commit();
+  st_.tlsStackMax = stack_thunk_get_max_usage();
 
-  if (failed) {
+  if (halted) {
+    ++st_.failedBatches;
+    pause(cfg::kHaltMs);
+    logf("upload: %s; needs a fix (URL, key or app), pausing %lu min", st_.lastError,
+         static_cast<unsigned long>(cfg::kHaltMs / 60000));
+  } else if (failed) {
     ++st_.failedBatches;
     const uint32_t wait = backoff_.next(os_random());
-    scheduleRetry(wait);
+    pause(wait);
     logf("upload: %s after %lu sent, %lu pending, retry in %lus", st_.lastError, static_cast<unsigned long>(sent),
          static_cast<unsigned long>(q_->pending()), static_cast<unsigned long>(wait / 1000));
+  } else if (sent == 0 && q_->pending() > 0) {
+    // front() refused without a network error: the flash could not be read.
+    snprintf(st_.lastError, sizeof st_.lastError, "queue read error (%lu)",
+             static_cast<unsigned long>(q_->readErrors()));
+    pause(backoff_.next(os_random()));
   } else {
     backoff_.reset();
     if (sent > 1 || q_->pending() > 0) {

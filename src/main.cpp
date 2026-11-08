@@ -13,6 +13,7 @@
 #include "fs_store.h"
 #include "log.h"
 #include "queue.h"
+#include "ram_store.h"
 #include "rtc_state.h"
 #include "secrets.h"
 #include "sensors.h"
@@ -28,20 +29,27 @@ namespace {
 constexpr time_t kSaneEpoch = 1700000000;  // anything earlier means "no clock yet"
 
 LittleFsStore store;
-ws::ReadingQueue queue(store, cfg::kRecordsPerSegment, cfg::kMaxSegments);
+RamStore ramStore;
+ws::ReadingQueue flashQueue(store, cfg::kRecordsPerSegment, cfg::kMaxSegments);
+ws::ReadingQueue ramQueue(ramStore, 36, 4);  // 12 h in RAM if the flash is unusable
+ws::ReadingQueue* queue = nullptr;
 Sensors sensors;
 WifiLink wifi;
 Uploader uploader;
 ESP8266WebServer web(80);
 
 RtcState rtc;
-bool safeMode = false;
+enum class Mode { Normal, NoUpload, Safe };
+Mode mode = Mode::Normal;
 bool fsOk = false;
 bool clockFromNtp = false;
 bool clockRestored = false;
 uint32_t lastNtpEpoch = 0;
 uint32_t lastSlot = 0;
-uint32_t measureRetryMs = 0;
+uint32_t failedSlot = 0;  // slot whose measurement failed, retried every 10 s within the grace
+uint32_t failedAtMs = 0;
+os_timer_t loopWatchdog;
+volatile uint32_t lastLoopMs = 0;
 uint32_t lastRtcSaveMs = 0;
 uint32_t queueWriteErrors = 0;
 uint32_t measured = 0;
@@ -60,7 +68,8 @@ void saveRtc() {
 
 [[noreturn]] void restart(const char* why) {
   logf("restart: %s", why);
-  if (fsOk) queue.commit();
+  if (queue) queue->commit();
+  rtc.intentional = 1;  // not a crash
   saveRtc();
   delay(100);
   ESP.restart();
@@ -104,7 +113,8 @@ void handleStatus() {
   jsonNum(s, "uptime_s", up / 1000);
   jsonStr(s, "reset_reason", resetReason);
   jsonNum(s, "boot_count", rtc.bootCount);
-  jsonBool(s, "safe_mode", safeMode);
+  jsonStr(s, "mode", mode == Mode::Normal ? "normal" : (mode == Mode::NoUpload ? "no-upload (after crashes)" : "safe (after crashes)"));
+  jsonNum(s, "crashes_in_a_row", rtc.crashes);
   char now[32] = "";
   if (clockValid()) {
     const time_t t = time(nullptr);
@@ -159,11 +169,12 @@ void handleStatus() {
   size_t fsUsed = 0, fsTotal = 0;
   if (fsOk) store.usage(fsUsed, fsTotal);
   s += F("},\"queue\":{");
-  jsonBool(s, "flash_ok", fsOk);
-  jsonNum(s, "pending", fsOk ? queue.pending() : 0);
-  jsonNum(s, "segments", fsOk ? queue.segments() : 0);
-  jsonNum(s, "dropped_full", fsOk ? queue.dropped() : 0);
-  jsonNum(s, "corrupt_skipped", fsOk ? queue.corrupt() : 0);
+  jsonStr(s, "storage", queue == &flashQueue ? "flash" : (queue ? "RAM (flash unusable)" : "none"));
+  jsonNum(s, "pending", queue ? queue->pending() : 0);
+  jsonNum(s, "segments", queue ? queue->segments() : 0);
+  jsonNum(s, "dropped_full", queue ? queue->dropped() : 0);
+  jsonNum(s, "corrupt_skipped", queue ? queue->corrupt() : 0);
+  jsonNum(s, "read_errors", queue ? queue->readErrors() : 0);
   jsonNum(s, "write_errors", queueWriteErrors);
   jsonNum(s, "fs_used", fsUsed);
   jsonNum(s, "fs_total", fsTotal, false);
@@ -175,7 +186,9 @@ void handleStatus() {
   jsonNum(s, "last_ok", us.lastOkEpoch);
   jsonNum(s, "last_status", us.lastStatus);
   jsonStr(s, "last_error", us.lastError);
-  jsonNum(s, "retry_in_s", uploader.retryInMs() / 1000, false);
+  jsonNum(s, "retry_in_s", uploader.retryInMs() / 1000);
+  jsonNum(s, "min_heap_in_tls", us.minHeapInTls);
+  jsonNum(s, "tls_stack_max", us.tlsStackMax, false);
   s += F("},\"heap\":{");
   jsonNum(s, "free", ESP.getFreeHeap());
   jsonNum(s, "max_block", ESP.getMaxFreeBlockSize());
@@ -210,11 +223,12 @@ void setupOta() {
   ArduinoOTA.setPasswordHash(OTA_PASSWORD_MD5);
   ArduinoOTA.onStart([] {
     logf("ota: update starting");
-    if (fsOk) queue.commit();
+    if (queue) queue->commit();
     saveRtc();
   });
   ArduinoOTA.onEnd([] {
     logf("ota: update written, restarting");
+    rtc.intentional = 1;  // ArduinoOTA restarts right after this
     saveRtc();
   });
   ArduinoOTA.onError([](ota_error_t e) { logf("ota: failed (%d)", static_cast<int>(e)); });
@@ -247,18 +261,19 @@ void measureIfDue() {
   const uint32_t now = static_cast<uint32_t>(time(nullptr));
   const uint32_t slot = now - now % cfg::kSlotS;
   if (slot == lastSlot || now - slot > cfg::kSlotGraceS) return;
-  if (static_cast<int32_t>(millis() - measureRetryMs) < 0) return;
+  if (slot == failedSlot && millis() - failedAtMs < 10000) return;  // retry every 10 s within the grace
 
   ws::Reading r;
   if (!sensors.measure(slot, r)) {
-    measureRetryMs = millis() + 10000;  // try again within the grace period
+    failedSlot = slot;
+    failedAtMs = millis();
     return;
   }
   lastSlot = slot;
   ++measured;
   lastReading = r;
   haveLastReading = true;
-  if (fsOk && !queue.push(r)) {
+  if (queue && !queue->push(r)) {
     ++queueWriteErrors;
     logf("queue: write failed (%lu so far)", static_cast<unsigned long>(queueWriteErrors));
   }
@@ -276,12 +291,23 @@ void watchdogs() {
   // Backlog, Wi-Fi up for a while, yet nothing accepted for hours: something in
   // the network stack is wedged. The queue is in flash and the clock in RTC
   // memory, so a restart costs nothing.
-  if (fsOk && queue.pending() > 0 && wifi.up() && clockValid() &&
+  if (mode == Mode::Normal && queue && queue->pending() > 0 && wifi.up() && clockValid() &&
       up - wifi.stats().upSinceMs > 30UL * 60 * 1000) {
     const uint32_t lastOk = uploader.stats().lastOkEpoch;
     const uint32_t since = lastOk ? static_cast<uint32_t>(time(nullptr)) - lastOk : up / 1000;
     if (since > cfg::kNoUploadRestartS) restart("no upload accepted for 3 h despite Wi-Fi");
   }
+}
+
+// Runs from the SDK's timer, so it still fires when loop() is stuck in a
+// delay()-based wait that the hardware watchdogs do not catch (e.g. a library
+// polling a dead I2C device forever). Busy loops trip the soft WDT anyway.
+void checkLoopStalled(void*) {
+  if (millis() - lastLoopMs < cfg::kLoopStallMs) return;
+  if (clockValid()) rtc.epoch = static_cast<uint32_t>(time(nullptr));
+  rtc.intentional = 0;  // counts as a crash on the next boot
+  rtcSave(rtc);
+  ESP.reset();
 }
 
 }  // namespace
@@ -298,15 +324,29 @@ void setup() {
     // Power-on or reset button: RTC memory is garbage or the outage length is unknown.
     rtc = RtcState{};
   }
+  // Exceptions and watchdogs report themselves; abort(), panics, out-of-memory
+  // and our own loop watchdog all come back as a plain software restart, which
+  // is a crash unless we flagged the restart as planned.
   const bool crashed = ri->reason == REASON_WDT_RST || ri->reason == REASON_EXCEPTION_RST ||
-                       ri->reason == REASON_SOFT_WDT_RST;
+                       ri->reason == REASON_SOFT_WDT_RST ||
+                       (ri->reason == REASON_SOFT_RESTART && haveRtc && !rtc.intentional);
   if (crashed) ++rtc.crashes;
+  rtc.intentional = 0;
   ++rtc.bootCount;
-  safeMode = rtc.crashes >= cfg::kCrashesForSafeMode;
+  mode = rtc.crashes >= cfg::kCrashesSafeMode ? Mode::Safe
+         : rtc.crashes >= cfg::kCrashesNoUpload ? Mode::NoUpload
+                                                : Mode::Normal;
   rtcSave(rtc);
 
-  logf("boot: weather-station %s, reset: %s, crashes in a row: %lu%s", FW_VERSION, resetReason,
-       static_cast<unsigned long>(rtc.crashes), safeMode ? " -> SAFE MODE (Wi-Fi, OTA and status only)" : "");
+  lastLoopMs = millis();
+  os_timer_setfn(&loopWatchdog, checkLoopStalled, nullptr);
+  os_timer_arm(&loopWatchdog, 10000, true);
+
+  logf("boot: weather-station %s, reset: %s, unplanned resets in a row: %lu%s", FW_VERSION, resetReason,
+       static_cast<unsigned long>(rtc.crashes),
+       mode == Mode::Safe       ? " -> SAFE MODE (Wi-Fi, OTA and status only)"
+       : mode == Mode::NoUpload ? " -> measuring and buffering, uploads off"
+                                : "");
 
   setupClock();
   wifi.begin(cfg::kHostname, WIFI_SSID, WIFI_PASS);
@@ -316,20 +356,25 @@ void setup() {
   web.onNotFound([] { web.send(404, F("text/plain"), F("not found\n")); });
   web.begin();
 
-  if (safeMode) return;
+  if (mode == Mode::Safe) return;
 
-  fsOk = store.begin() && queue.begin();
+  fsOk = store.begin() && flashQueue.begin();
   if (fsOk) {
-    logf("queue: %lu readings waiting in %u segments", static_cast<unsigned long>(queue.pending()),
-         static_cast<unsigned>(queue.segments()));
+    queue = &flashQueue;
+    logf("queue: %lu readings waiting in %u segments", static_cast<unsigned long>(queue->pending()),
+         static_cast<unsigned>(queue->segments()));
   } else {
-    logf("queue: flash unusable, readings will not survive an outage");
+    ramQueue.begin();
+    queue = &ramQueue;
+    logf("queue: flash unusable, buffering up to 12 h in RAM (lost on reset)");
   }
+  lastLoopMs = millis();
   sensors.begin();
-  uploader.begin(fsOk ? &queue : nullptr, {cfg::kAltitudeM, cfg::kPressureOffsetHpa});
+  uploader.begin(mode == Mode::Normal ? queue : nullptr, {cfg::kAltitudeM, cfg::kPressureOffsetHpa});
 }
 
 void loop() {
+  lastLoopMs = millis();
   const bool timeOk = clockValid();
   // Do not start a blocking Wi-Fi scan in the 5 s before a measurement.
   const bool quiet = timeOk && (cfg::kSlotS - static_cast<uint32_t>(time(nullptr) % cfg::kSlotS)) < 5;
@@ -337,15 +382,14 @@ void loop() {
   ArduinoOTA.handle();
   web.handleClient();
 
-  if (safeMode) {
-    if (millis() > cfg::kSafeModeMaxMs) {
-      rtc.crashes = 0;
-      restart("safe mode timeout, trying normal mode again");
-    }
-  } else {
+  if (mode != Mode::Safe) {
     measureIfDue();
     uploader.loop(wifi.up(), timeOk);
     watchdogs();
+  }
+  if (mode != Mode::Normal && millis() > cfg::kDegradedMaxMs) {
+    rtc.crashes = 0;
+    restart("an hour in degraded mode, trying normal mode again");
   }
 
   if (millis() - lastRtcSaveMs > cfg::kRtcSaveMs) saveRtc();

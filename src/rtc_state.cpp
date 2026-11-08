@@ -5,9 +5,10 @@
 #include "crc.h"
 
 namespace {
-// User RTC memory words 64..127 are used by the OTA bootloader (eboot); stay below.
+// User RTC memory words 0..31 (0x60001200) hold the OTA bootloader's command
+// block (eboot); start behind it. Change kMagic whenever RtcState changes.
 constexpr uint32_t kOffsetWords = 32;
-constexpr uint32_t kMagic = 0x57535431;  // "WST1"
+constexpr uint32_t kMagic = 0x57535432;  // "WST2"
 
 struct Block {
   uint32_t magic;

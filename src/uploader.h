@@ -9,8 +9,10 @@ struct UploadStats {
   uint32_t accepted = 0;
   uint32_t rejected = 0;
   uint32_t failedBatches = 0;
-  uint32_t lastOkEpoch = 0;  // wall clock of the last accepted reading
-  int lastStatus = 0;        // HTTP status or negative HTTPClient/TLS error
+  uint32_t lastOkEpoch = 0;   // wall clock of the last accepted reading
+  int lastStatus = 0;         // HTTP status or negative HTTPClient error
+  uint32_t minHeapInTls = 0;  // lowest free heap seen while a connection was open
+  uint32_t tlsStackMax = 0;   // deepest use of the BearSSL stack, bytes
   char lastError[64] = "";
 };
 
@@ -29,11 +31,14 @@ class Uploader {
 
  private:
   void sendBatch();
-  void scheduleRetry(uint32_t ms);
+  void pause(uint32_t ms);
 
   ws::ReadingQueue* q_ = nullptr;
   ws::Calibration cal_{};
   ws::Backoff backoff_{15000, 10UL * 60 * 1000};
-  uint32_t nextMs_ = 0;
+  bool paused_ = false;      // elapsed-time form, safe across the 49-day millis() wrap
+  uint32_t pausedAtMs_ = 0;
+  uint32_t pauseMs_ = 0;
+  uint8_t rejectsInARow_ = 0;
   UploadStats st_;
 };

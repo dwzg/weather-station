@@ -90,7 +90,13 @@ void ReadingQueue::dropOldest() {
 }
 
 bool ReadingQueue::push(const Reading& r) {
-  if (segs_.empty() || segs_.back().sealed || segs_.back().count >= perSegment_) {
+  if (!segs_.empty() && segs_.back().sealed && segs_.back().count == 0) {
+    // The newest segment holds nothing usable (its first append failed). Start
+    // it over instead of opening another one: empty segments must never count
+    // towards the cap and push real readings out.
+    store_.removeSegment(segs_.back().id);
+    segs_.back().sealed = false;
+  } else if (segs_.empty() || segs_.back().sealed || segs_.back().count >= perSegment_) {
     if (!segs_.empty()) segs_.back().sealed = true;
     segs_.push_back({++lastId_, 0, false});
     while (segs_.size() > maxSegments_) dropOldest();
@@ -127,12 +133,19 @@ bool ReadingQueue::front(Reading& out) {
       continue;
     }
     uint8_t rec[kRecordSize];
-    if (store_.read(seg.id, cursorIdx_ * kRecordSize, rec, sizeof rec) && decodeReading(rec, out)) {
+    if (!store_.read(seg.id, cursorIdx_ * kRecordSize, rec, sizeof rec)) {
+      // An I/O error says nothing about the data: stop here and let the caller
+      // retry later. Skipping on it would walk the cursor through, and the next
+      // commit would delete, the whole backlog.
+      ++readErrors_;
+      return false;
+    }
+    if (decodeReading(rec, out)) {
       frontValid_ = true;
       frontEpoch_ = out.epoch;
       return true;
     }
-    ++corrupt_;
+    ++corrupt_;  // readable but damaged (torn write, flipped bits): skip just this record
     ++cursorIdx_;
     dirty_ = true;
   }

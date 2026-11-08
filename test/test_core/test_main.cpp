@@ -25,6 +25,7 @@ struct MemStore : SegmentStore {
   std::map<uint32_t, std::vector<uint8_t>> segs;
   std::vector<uint8_t> cursor;
   bool failAppend = false;
+  bool failRead = false;
   size_t tearAppendAt = 0;  // if > 0: the next append writes only this many bytes and fails
 
   bool listSegments(std::vector<uint32_t>& ids) override {
@@ -47,6 +48,7 @@ struct MemStore : SegmentStore {
     return true;
   }
   bool read(uint32_t id, uint32_t off, uint8_t* d, size_t n) override {
+    if (failRead) return false;
     auto it = segs.find(id);
     if (it == segs.end() || off + n > it->second.size()) return false;
     memcpy(d, it->second.data() + off, n);
@@ -252,6 +254,57 @@ void test_queue_failed_append_is_reported() {
   TEST_ASSERT_EQUAL_UINT32(1, q.pending());
 }
 
+
+void test_queue_read_error_keeps_backlog() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  for (uint32_t i = 1; i <= 12; ++i) q.push(mk(i * 300));
+  s.failRead = true;
+  Reading r;
+  TEST_ASSERT_FALSE(q.front(r));
+  q.commit();
+  TEST_ASSERT_EQUAL_UINT32(12, q.pending());
+  TEST_ASSERT_EQUAL_UINT32(0, q.corrupt());
+  TEST_ASSERT_EQUAL(3, (int)s.segs.size());
+  s.failRead = false;
+  TEST_ASSERT_EQUAL_UINT32(12, drain(q));
+}
+
+void test_queue_repeated_write_failures_keep_data() {
+  MemStore s;
+  ReadingQueue q(s, 4, 3);
+  q.begin();
+  for (uint32_t i = 1; i <= 6; ++i) q.push(mk(i * 300));
+  s.failAppend = true;
+  for (int i = 0; i < 100; ++i) TEST_ASSERT_FALSE(q.push(mk(9000 + i)));
+  s.failAppend = false;
+  TEST_ASSERT_EQUAL_UINT32(6, q.pending());
+  TEST_ASSERT_EQUAL_UINT32(0, q.dropped());
+  TEST_ASSERT_TRUE(q.push(mk(99000)));
+  std::vector<uint32_t> got;
+  drain(q, &got);
+  TEST_ASSERT_EQUAL(7, (int)got.size());
+  TEST_ASSERT_EQUAL_UINT32(300, got.front());
+  TEST_ASSERT_EQUAL_UINT32(99000, got.back());
+}
+
+void test_queue_torn_first_append_reuses_segment() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  for (uint32_t i = 1; i <= 4; ++i) q.push(mk(i * 300));  // fills segment 1
+  s.tearAppendAt = 5;
+  TEST_ASSERT_FALSE(q.push(mk(1500)));  // segment 2 now holds 5 garbage bytes
+  TEST_ASSERT_TRUE(q.push(mk(1800)));   // segment 2 is started over
+  TEST_ASSERT_EQUAL(2, (int)s.segs.size());
+  std::vector<uint32_t> got;
+  drain(q, &got);
+  TEST_ASSERT_EQUAL(5, (int)got.size());
+  TEST_ASSERT_EQUAL_UINT32(1800, got.back());
+  TEST_ASSERT_EQUAL_UINT32(0, q.corrupt());
+}
+
 // ---- time -----------------------------------------------------------------------------
 
 void test_iso_local_with_offset() {
@@ -319,6 +372,8 @@ void test_classify() {
   TEST_ASSERT_TRUE(classifyResponse(422) == Outcome::Rejected);
   TEST_ASSERT_TRUE(classifyResponse(401) == Outcome::Halt);
   TEST_ASSERT_TRUE(classifyResponse(404) == Outcome::Halt);
+  TEST_ASSERT_TRUE(classifyResponse(307) == Outcome::Halt);
+  TEST_ASSERT_TRUE(classifyResponse(413) == Outcome::Halt);
   TEST_ASSERT_TRUE(classifyResponse(429) == Outcome::Retry);
   TEST_ASSERT_TRUE(classifyResponse(502) == Outcome::Retry);
   TEST_ASSERT_TRUE(classifyResponse(-1) == Outcome::Retry);
@@ -376,6 +431,9 @@ int main() {
   RUN_TEST(test_queue_bad_cursor_starts_from_oldest);
   RUN_TEST(test_queue_push_after_full_drain_and_reboot);
   RUN_TEST(test_queue_failed_append_is_reported);
+  RUN_TEST(test_queue_read_error_keeps_backlog);
+  RUN_TEST(test_queue_repeated_write_failures_keep_data);
+  RUN_TEST(test_queue_torn_first_append_reuses_segment);
   RUN_TEST(test_iso_local_with_offset);
   RUN_TEST(test_iso_dst_fold_is_unambiguous);
   RUN_TEST(test_days_from_civil);

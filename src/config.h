@@ -41,13 +41,14 @@ constexpr uint32_t kHttpTimeoutMs = 12000;
 constexpr uint32_t kRetryMinMs = 15000;
 constexpr uint32_t kRetryMaxMs = 10UL * 60 * 1000;
 constexpr uint32_t kHaltMs = 30UL * 60 * 1000;  // after 401/403/404: someone has to fix the config
-constexpr uint32_t kMinHeapBlockForTls = 22000;
 
 // Self-healing
-constexpr uint32_t kStableUptimeMs = 10UL * 60 * 1000;     // clears the crash counter
-constexpr uint8_t kCrashesForSafeMode = 3;
-constexpr uint32_t kSafeModeMaxMs = 60UL * 60 * 1000;      // then try normal mode again
-constexpr uint32_t kNoUploadRestartS = 3UL * 3600;         // backlog, Wi-Fi up, nothing accepted
+constexpr uint32_t kStableUptimeMs = 10UL * 60 * 1000;  // clears the crash counter
+constexpr uint8_t kCrashesNoUpload = 3;   // then: measure and buffer, but do not upload
+constexpr uint8_t kCrashesSafeMode = 5;   // then: Wi-Fi, OTA and status page only
+constexpr uint32_t kDegradedMaxMs = 60UL * 60 * 1000;  // then try normal mode again
+constexpr uint32_t kLoopStallMs = 180000;  // loop() not run for this long: reset (worst batch ~80 s)
+constexpr uint32_t kNoUploadRestartS = 3UL * 3600;     // backlog, Wi-Fi up, nothing accepted
 constexpr uint32_t kRtcSaveMs = 5000;
 
 }  // namespace cfg

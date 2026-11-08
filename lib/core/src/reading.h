@@ -27,6 +27,9 @@ struct Reading {
 constexpr size_t kRecordSize = 16;
 constexpr uint8_t kRecordVersion = 1;
 
+// If the format ever changes, bump kRecordVersion and keep decoding version 1:
+// otherwise every reading still queued at the update is skipped as corrupt.
+//
 // Layout (little endian): epoch u32 | temp i16 | hum u16 | pressure u32 | source u8 |
 // version u8 | crc16 over bytes 0..13.
 void encodeReading(const Reading& r, uint8_t out[kRecordSize]);

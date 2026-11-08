@@ -38,13 +38,16 @@ class ReadingQueue {
 
   bool begin();
   bool push(const Reading& r);
-  bool front(Reading& out);  // oldest undelivered reading; skips corrupt records
+  // Oldest undelivered reading. Skips records that fail their CRC; returns
+  // false (without skipping anything) when the store cannot be read.
+  bool front(Reading& out);
   void pop();                // marks the reading front() returned as delivered
   bool commit();             // persists the cursor and deletes delivered segments
 
   uint32_t pending() const;
   uint32_t dropped() const { return dropped_; }
   uint32_t corrupt() const { return corrupt_; }
+  uint32_t readErrors() const { return readErrors_; }
   size_t segments() const { return segs_.size(); }
   uint32_t oldestEpochHint() const { return frontEpoch_; }  // epoch of the last front(), 0 if none
 
@@ -67,6 +70,7 @@ class ReadingQueue {
   uint32_t cursorIdx_ = 0;
   uint32_t dropped_ = 0;
   uint32_t corrupt_ = 0;
+  uint32_t readErrors_ = 0;
   uint32_t frontEpoch_ = 0;
   bool frontValid_ = false;
   bool dirty_ = false;
