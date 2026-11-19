@@ -102,3 +102,10 @@ pub fn running_image_unconfirmed() -> bool {
 pub fn restart_now() -> ! {
     unsafe { sys::esp_restart() }
 }
+
+/// Resets through the panic handler: no shutdown handlers (esp_restart() runs
+/// them on the calling task, and a wedged driver can block one, e.g. Wi-Fi
+/// stop). Reported as a panic on the next boot, so it counts as a crash.
+pub fn abort_now(why: &core::ffi::CStr) -> ! {
+    unsafe { sys::esp_system_abort(why.as_ptr()) }
+}

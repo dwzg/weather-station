@@ -400,7 +400,9 @@ fn run(tz: TimeZone) -> anyhow::Result<std::convert::Infallible> {
         }
         s.intentional = 0;
         rtc::save(&s);
-        platform::restart_now();
+        // Not esp_restart(): the loop may be stuck in it (a planned restart
+        // whose Wi-Fi shutdown blocks), and it would block here the same way.
+        platform::abort_now(c"main loop stalled");
     })?;
     loop_watchdog.every(Duration::from_secs(10))?;
 
