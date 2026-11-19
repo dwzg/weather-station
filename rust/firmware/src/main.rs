@@ -429,6 +429,17 @@ fn run(tz: TimeZone) -> anyhow::Result<std::convert::Infallible> {
     if clock_restored {
         platform::trust_clock();
     }
+    let p = Peripherals::take()?;
+    let wifi = WifiLink::new(
+        p.modem,
+        EspSystemEventLoop::take()?,
+        EspDefaultNvsPartition::take()?,
+        env!("WS_WIFI_SSID"),
+        env!("WS_WIFI_PASS"),
+    )?;
+
+    // After the Wi-Fi driver: creating its netif starts lwIP's TCP/IP task,
+    // which SNTP needs (before it, SNTP asserts "Invalid mbox" in tcpip_callback).
     let mut sntp_conf = SntpConf::default();
     for (slot, server) in sntp_conf.servers.iter_mut().zip(config::NTP_SERVERS) {
         *slot = server;
@@ -438,15 +449,6 @@ fn run(tz: TimeZone) -> anyhow::Result<std::convert::Infallible> {
             info!("clock: NTP sync");
         }
     })?;
-
-    let p = Peripherals::take()?;
-    let wifi = WifiLink::new(
-        p.modem,
-        EspSystemEventLoop::take()?,
-        EspDefaultNvsPartition::take()?,
-        env!("WS_WIFI_SSID"),
-        env!("WS_WIFI_PASS"),
-    )?;
     let ota_key: [u8; 32] =
         ws_core::ota::from_hex(env!("WS_OTA_KEY")).and_then(|k| k.try_into().ok()).expect("OTA_KEY");
     let _server = web::start(ota_key)?;
