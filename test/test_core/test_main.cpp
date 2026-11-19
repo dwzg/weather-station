@@ -71,7 +71,7 @@ static Reading mk(uint32_t epoch) {
   r.epoch = epoch;
   r.tempCenti = static_cast<int16_t>(epoch % 1000) - 300;
   r.humCenti = 5000;
-  r.stationDeciPa = 9920000;
+  r.stationDeciPa = 992000;
   return r;
 }
 
@@ -341,16 +341,13 @@ void test_body() {
   Reading r = mk(1794128400);
   r.tempCenti = -5;
   r.humCenti = 10000;
-  r.stationDeciPa = 9920000;  // 992.000 hPa
+  r.stationDeciPa = 992000;  // 992.000 hPa (0.1 Pa units)
   Calibration cal{298.0, -3.2};
   char b[160];
   TEST_ASSERT_TRUE(buildBody(r, cal, b, sizeof b) > 0);
-  char expect[160];
-  char p[16];
-  formatCenti(seaLevelCentiHpa(r, cal), p, sizeof p);
-  snprintf(expect, sizeof expect,
-           "{\"timestamp\":\"2026-11-08T10:00:00+01:00\",\"temperature\":-0.05,\"humidity\":100.00,\"pressure\":%s}", p);
-  TEST_ASSERT_EQUAL_STRING(expect, b);
+  // 988.8 hPa at -0.05 degC, 100 %, 298 m, computed independently in Python.
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"timestamp\":\"2026-11-08T10:00:00+01:00\",\"temperature\":-0.05,\"humidity\":100.00,\"pressure\":1026.12}", b);
   TEST_ASSERT_EQUAL(0, (int)buildBody(r, cal, b, 20));  // too small: refuse, never truncate
 }
 

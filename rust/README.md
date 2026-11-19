@@ -90,6 +90,5 @@ bootloader goes back to the previous image.
 | Status JSON | | same fields. `upload.last_status` is 0 when there was no HTTP answer (was a negative HTTPClient code). `heap` has `free`, `min_free`, `max_block`. New: `ota.unconfirmed`, `upload.last_batch_ms`. Dropped: the BearSSL figures. |
 
 The pressure offset (−3.2 hPa) belongs to the BME280, so it moves with the
-sensor. The S2 and its always-on radio warm the enclosure more than the D1
-mini did, so compare temperature (and the offset) against the reference again
-after the switch.
+sensor. The sensor sits in its own enclosure, away from the board, so the
+S2's own warmth does not reach it.
