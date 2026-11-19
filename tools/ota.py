@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Updates the station over Wi-Fi.
 
-    tools/ota.py 192.168.178.57 ws.bin    (ws.bin: espflash save-image, see README)
+    tools/ota.py <station-ip> ws.bin    (ws.bin: espflash save-image, see README)
 
 The password comes from $OTA_PASSWORD or ~/.config/homelab/weather-station/ota.pass.
 The station hands out a one-time nonce, checks an HMAC over the nonce and the

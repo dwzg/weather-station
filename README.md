@@ -118,11 +118,11 @@ From `firmware/`:
 
 ```bash
 espflash save-image --chip esp32s2 target/xtensa-esp32s2-espidf/release/weather-station ws.bin
-../tools/ota.py 192.168.178.57 ws.bin          # password from ~/.config/homelab/weather-station/ota.pass
+../tools/ota.py <station-ip> ws.bin            # OTA password from $OTA_PASSWORD or the secrets folder
 ```
 
-The FRITZ!Box always gives 192.168.178.57 to the station's MAC
-(`80:65:99:4d:c1:1a`), hostname `weather-station`.
+Give the station a fixed address in the router (a DHCP reservation for its
+MAC address); its hostname is `weather-station`.
 
 `ota.py` then waits until the new image has confirmed itself (see below, up to
 ~10 min) and exits 0 only then; `--no-wait` stops once the station runs the new
