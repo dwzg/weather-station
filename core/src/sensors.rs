@@ -231,8 +231,7 @@ mod tests {
         /// [reg] sets the read pointer; [reg, value, reg, value, ...] writes.
         fn write(&mut self, b: &[u8]) {
             self.ptr = b[0];
-            for pair in b.chunks_exact(2) {
-                let (reg, v) = (pair[0], pair[1]);
+            for &[reg, v] in b.as_chunks::<2>().0 {
                 self.regs[reg as usize] = v;
                 if reg == 0xF4 && v & 0b11 == 0b01 {
                     let (p, t, h) = self.adc;
