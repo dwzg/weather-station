@@ -44,3 +44,5 @@ jobs:
           key: esp-idf-v5.5.5-esp32s2-${{ hashFiles('rust/firmware/sdkconfig.defaults') }}
       - run: cargo build --release
         working-directory: rust/firmware
+        env:
+          WS_EXAMPLE_SECRETS: "1" # no real credentials in CI
