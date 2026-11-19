@@ -81,6 +81,17 @@ pub fn start(ota_key: Key) -> anyhow::Result<EspHttpServer<'static>> {
             (header("X-OTA-Nonce"), header("X-OTA-SHA256").to_ascii_lowercase(), header("X-OTA-Auth"));
         let len: usize = header("Content-Length").parse().unwrap_or(0);
 
+        if !NONCES.lock().unwrap().take(&nonce, platform::millis()) {
+            return refuse(req, 403, "unknown or expired nonce");
+        }
+        if !ota::verify(&ota_key, &nonce, &sha, len, &auth) {
+            return refuse(req, 403, "bad signature");
+        }
+        if len == 0 || len > MAX_IMAGE {
+            return refuse(req, 413, "image size");
+        }
+        // Only an authenticated update holds off uploads and planned restarts:
+        // anyone on the network can send a request.
         if OTA_BUSY.swap(true, Ordering::AcqRel) {
             return refuse(req, 409, "another update is running");
         }
@@ -92,15 +103,6 @@ pub fn start(ota_key: Key) -> anyhow::Result<EspHttpServer<'static>> {
         }
         let _done = Done;
 
-        if !NONCES.lock().unwrap().take(&nonce, platform::millis()) {
-            return refuse(req, 403, "unknown or expired nonce");
-        }
-        if !ota::verify(&ota_key, &nonce, &sha, len, &auth) {
-            return refuse(req, 403, "bad signature");
-        }
-        if len == 0 || len > MAX_IMAGE {
-            return refuse(req, 413, "image size");
-        }
         if platform::running_image_unconfirmed() {
             // ESP-IDF writes no new image while the running one is unconfirmed.
             // Return to the previous, confirmed image; the updater retries there.

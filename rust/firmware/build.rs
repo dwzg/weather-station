@@ -1,8 +1,9 @@
 //! ESP-IDF environment, the firmware version and the secrets.
 //!
 //! Secrets come from `secrets.env` (git-ignored, written by
-//! tools/make-secrets.py); without it the build uses `secrets.example.env`
-//! and warns, so CI can build without real credentials.
+//! tools/make-secrets.py). Without it the build fails, unless
+//! `WS_EXAMPLE_SECRETS=1` asks for `secrets.example.env` (CI): such an image
+//! cannot reach the network, and its OTA key is all zeros.
 
 use std::path::Path;
 use std::process::Command;
@@ -12,11 +13,17 @@ const KEYS: [&str; 5] = ["WIFI_SSID", "WIFI_PASS", "API_URL", "API_KEY", "OTA_KE
 fn main() {
     embuild::espidf::sysenv::output();
 
+    println!("cargo:rerun-if-env-changed=WS_EXAMPLE_SECRETS");
     let file = if Path::new("secrets.env").exists() {
         "secrets.env"
-    } else {
-        println!("cargo:warning=secrets.env missing, building with secrets.example.env (no network access)");
+    } else if std::env::var("WS_EXAMPLE_SECRETS").as_deref() == Ok("1") {
+        println!("cargo:warning=building with secrets.example.env: no network access, OTA key all zeros");
         "secrets.example.env"
+    } else {
+        panic!(
+            "secrets.env missing: run tools/make-secrets.py (or set WS_EXAMPLE_SECRETS=1 \
+             for a build that cannot reach the network and has an all-zero OTA key)"
+        );
     };
     println!("cargo:rerun-if-changed=secrets.env");
     println!("cargo:rerun-if-changed=secrets.example.env");

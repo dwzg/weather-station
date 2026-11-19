@@ -37,7 +37,7 @@ espup install                 # then: . ~/export-esp.sh
 
 cd rust/core && cargo test    # host tests (queue, time, pressure, sensors, uploader, OTA auth)
 
-python3 tools/make-secrets.py # also writes rust/firmware/secrets.env (never committed)
+python3 tools/make-secrets.py # also writes rust/firmware/secrets.env (never committed; the build needs it)
 cd rust/firmware
 cargo build --release         # first build downloads ESP-IDF to ~/.espressif (~10 min)
 ```
@@ -92,9 +92,15 @@ The S2 replaced the ESP8266 in the station on 2026-11-19 and took over its
 address: the FRITZ!Box always gives 192.168.178.57 to the S2's MAC
 (`80:65:99:4d:c1:1a`). The ESP8266 used the same hostname, `weather-station`.
 
-`ota-s2.py` waits for the station to come back at the address it was given;
-if the update changes the address (as a new DHCP lease can), it reports
-"did not come back" although the update went through. Check the status page.
+`ota-s2.py` then waits until the new image has confirmed itself (see below,
+up to ~10 min) and exits 0 only then; `--no-wait` stops once the station runs
+the new image. It recognises the restart by the status page's boot count and
+uptime at the address it was given; if the update changes the address (as a
+new DHCP lease can), it reports "did not restart" although the update may have
+gone through. Check the status page.
+
+Without `secrets.env` the build stops. `WS_EXAMPLE_SECRETS=1` builds with
+`secrets.example.env` instead (CI does): no network access, all-zero OTA key.
 
 The station hands out a one-time nonce (`GET /ota/nonce`). Before writing
 anything it checks an HMAC-SHA256 over the nonce, the image's SHA-256 and its

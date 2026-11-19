@@ -15,20 +15,36 @@ pub struct LittleFsStore {
 }
 
 impl LittleFsStore {
-    /// Mounts the partition (formatting it if it cannot be mounted).
+    /// Mounts the partition. Formats it only if it still cannot be mounted on a
+    /// second try, and says so in the log: formatting loses the whole queue.
     pub fn mount(base: &str, partition: &str) -> Option<Self> {
         let c_base = CString::new(base).ok()?;
         let label = CString::new(partition).ok()?;
-        let mut conf = sys::esp_vfs_littlefs_conf_t {
-            base_path: c_base.as_ptr(),
-            partition_label: label.as_ptr(),
-            ..Default::default()
+        let register = |format: bool| {
+            let mut conf = sys::esp_vfs_littlefs_conf_t {
+                base_path: c_base.as_ptr(),
+                partition_label: label.as_ptr(),
+                ..Default::default()
+            };
+            conf.set_format_if_mount_failed(u8::from(format));
+            // SAFETY: the strings outlive the call; the VFS copies the base path.
+            sys::esp!(unsafe { sys::esp_vfs_littlefs_register(&conf) })
         };
-        conf.set_format_if_mount_failed(1);
-        // SAFETY: the strings outlive the call; the VFS copies the base path.
-        if let Err(e) = sys::esp!(unsafe { sys::esp_vfs_littlefs_register(&conf) }) {
-            warn!("fs: mount failed ({e})");
-            return None;
+        if let Err(e) = register(false) {
+            // ESP_FAIL is lfs_mount() failing; anything else (no such partition,
+            // no memory) is not something formatting would fix.
+            if e.code() != sys::ESP_FAIL {
+                warn!("fs: mount failed ({e})");
+                return None;
+            }
+            warn!("fs: mount failed ({e}), trying again");
+            if register(false).is_err() {
+                warn!("fs: cannot mount the queue partition; formatting it (the readings in it are lost)");
+                if let Err(e) = register(true) {
+                    warn!("fs: format failed ({e})");
+                    return None;
+                }
+            }
         }
         let dir = format!("{base}/q");
         if fs::metadata(&dir).is_err() {

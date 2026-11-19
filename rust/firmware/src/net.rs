@@ -2,8 +2,10 @@
 //! Encrypt's roots (certs/ at the repository root), so renewals and new
 //! intermediates need no firmware update.
 
+use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::http::client::{Configuration, EspHttpConnection};
 use esp_idf_svc::http::Method;
+use esp_idf_svc::sys;
 use esp_idf_svc::tls::X509;
 use ws_core::uploader::{Response, Transport};
 
@@ -22,6 +24,8 @@ static TRUST_ANCHORS: &[u8] = concat!(
 
 pub struct Https {
     conn: EspHttpConnection,
+    /// The last answer did not keep the connection open: start a new client.
+    reconnect: bool,
     url: &'static str,
     key: &'static str,
     user_agent: String,
@@ -35,16 +39,25 @@ impl Https {
         if free < config::TLS_MIN_FREE_HEAP || block < config::TLS_MIN_BLOCK {
             return Err(format!("low memory (free {free}, block {block})"));
         }
-        let conf = Configuration {
-            timeout: Some(config::HTTP_TIMEOUT),
-            server_certificate: Some(X509::pem_until_nul(TRUST_ANCHORS)),
-            buffer_size: Some(1024),
-            buffer_size_tx: Some(1024),
-            ..Default::default()
-        };
-        let conn = EspHttpConnection::new(&conf).map_err(|e| format!("http client: {e}"))?;
-        Ok(Self { conn, url, key, user_agent: format!("weather-station/{}", env!("FW_VERSION")) })
+        Ok(Self {
+            conn: client()?,
+            reconnect: false,
+            url,
+            key,
+            user_agent: format!("weather-station/{}", env!("FW_VERSION")),
+        })
     }
+}
+
+fn client() -> Result<EspHttpConnection, String> {
+    let conf = Configuration {
+        timeout: Some(config::HTTP_TIMEOUT),
+        server_certificate: Some(X509::pem_until_nul(TRUST_ANCHORS)),
+        buffer_size: Some(1024),
+        buffer_size_tx: Some(1024),
+        ..Default::default()
+    };
+    EspHttpConnection::new(&conf).map_err(|e| format!("http client: {e}"))
 }
 
 impl Transport for Https {
@@ -56,6 +69,14 @@ impl Transport for Https {
             ("X-API-Key", self.key),
             ("User-Agent", self.user_agent.as_str()),
         ];
+        // esp_http_client closes a connection the server does not keep alive
+        // (`Connection: close`, HTTP/1.0) only in esp_http_client_perform(), not
+        // on this streaming path: the next request would go out on the closed
+        // socket and fail. A new client connects afresh.
+        if self.reconnect {
+            self.conn = client()?;
+            self.reconnect = false;
+        }
         let c = &mut self.conn;
         c.initiate_request(Method::Post, self.url, &headers).map_err(|e| format!("connect: {e}"))?;
         c.write_all(body.as_bytes()).map_err(|e| format!("send: {e:?}"))?;
@@ -76,6 +97,8 @@ impl Transport for Https {
                 Err(e) => return Err(format!("read: {e}")),
             }
         }
+        // SAFETY: the handle belongs to `c`, which is alive; the call only reads the parser state.
+        self.reconnect = !unsafe { sys::esp_http_client_is_persistent_connection(c.handle()) };
         Ok(Response { status, body: String::from_utf8_lossy(&text).trim().to_string() })
     }
 }

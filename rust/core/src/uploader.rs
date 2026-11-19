@@ -473,6 +473,21 @@ mod tests {
     }
 
     #[test]
+    fn other_4xx_does_not_block_the_queue() {
+        // 409 for r1 only: it goes once the app takes the newest; the rest follow.
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(409), Ok(200), Ok(200), Ok(200)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, u.stats().accepted, q.pending()), (1, 2, 0));
+        // 410 for everything: the app is gone, keep all and halt.
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(410), Ok(410)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, q.pending()), (0, 3));
+        assert_eq!(u.retry_in_ms(ms.get()), 1_800_000);
+    }
+
+    #[test]
     fn broken_app_loses_nothing() {
         let (mut u, mut q, mut env, ms) = setup(5);
         let mut t = transport(&ms, vec![Ok(422), Ok(422)]);
