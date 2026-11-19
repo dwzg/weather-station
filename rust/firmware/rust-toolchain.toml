@@ -1,0 +1,4 @@
+# The ESP32-S2 is an Xtensa chip: it needs Espressif's Rust fork, installed by
+# `espup install` (https://github.com/esp-rs/espup).
+[toolchain]
+channel = "esp"

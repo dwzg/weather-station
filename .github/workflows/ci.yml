@@ -17,3 +17,30 @@ jobs:
       - run: pip install platformio==6.2.0
       - run: pio test -e native
       - run: cp include/secrets.example.h include/secrets.h && pio run -e station
+
+  rust-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: cargo test
+        working-directory: rust/core
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: rust/core
+      - run: python3 tools/ota-s2.py --self-test | grep -q 582918a97d97d3d3c90c3078b02e5bc955296f0c82e56ff00f4a07148f3011b4
+
+  rust-firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32s2
+          ldproxy: true
+      - uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: esp-idf-v5.5.5-esp32s2-${{ hashFiles('rust/firmware/sdkconfig.defaults') }}
+      - run: cargo build --release
+        working-directory: rust/firmware

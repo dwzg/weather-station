@@ -1,0 +1,36 @@
+[package]
+name = "weather-station"
+version = "0.1.0"
+edition = "2021"
+description = "Weather station firmware for the Wemos Lolin S2 mini (ESP32-S2)"
+publish = false
+
+[[bin]]
+name = "weather-station"
+harness = false # no tests on the device; the logic is tested in ../core
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+anyhow = "1"
+embedded-hal = "1.0"
+esp-idf-svc = "0.53"
+log = "0.4"
+ws-core = { path = "../core" }
+
+[build-dependencies]
+embuild = "0.33"
+
+# LittleFS for the reading queue (the ESP8266 build used it too): power-loss
+# safe, with atomic rename for the cursor.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "joltwallet/littlefs", version = "1.23.1" }
+bindings_header = "src/bindings.h"

@@ -19,6 +19,11 @@ Outcome classifyResponse(int s) {
   return Outcome::Retry;  // <= 0 (no connection, TLS, timeout), 408, 429, 5xx, anything unexpected
 }
 
+bool appAccepts(const Reading& r, const Calibration& cal) {
+  const int32_t p0 = seaLevelCentiHpa(r, cal);
+  return r.tempCenti >= -4000 && r.tempCenti <= 6000 && r.humCenti <= 10000 && p0 >= 80000 && p0 <= 110000;
+}
+
 int32_t seaLevelCentiHpa(const Reading& r, const Calibration& cal) {
   const double station = r.stationDeciPa / 1000.0 + cal.pressureOffsetHpa;
   const double p0 = seaLevelPressureDwd(station, r.tempCenti / 100.0, r.humCenti / 100.0, cal.altitudeM);

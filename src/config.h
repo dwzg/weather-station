@@ -49,6 +49,7 @@ constexpr uint8_t kCrashesSafeMode = 5;   // then: Wi-Fi, OTA and status page on
 constexpr uint32_t kDegradedMaxMs = 60UL * 60 * 1000;  // then try normal mode again
 constexpr uint32_t kLoopStallMs = 180000;  // loop() not run for this long: reset (worst batch ~80 s)
 constexpr uint32_t kNoUploadRestartS = 3UL * 3600;     // backlog, Wi-Fi up, nothing accepted
+constexpr uint32_t kWifiDownRestartMs = 6UL * 3600 * 1000;  // Wi-Fi down this long: the driver may be wedged
 constexpr uint32_t kRtcSaveMs = 5000;
 
 }  // namespace cfg

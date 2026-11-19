@@ -4,6 +4,8 @@
 #include <unity.h>
 
 #include <map>
+#include <set>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,7 @@ struct MemStore : SegmentStore {
   std::vector<uint8_t> cursor;
   bool failAppend = false;
   bool failRead = false;
+  std::set<std::pair<uint32_t, uint32_t>> failReadAt;  // (segment, byte offset)
   size_t tearAppendAt = 0;  // if > 0: the next append writes only this many bytes and fails
 
   bool listSegments(std::vector<uint32_t>& ids) override {
@@ -48,7 +51,7 @@ struct MemStore : SegmentStore {
     return true;
   }
   bool read(uint32_t id, uint32_t off, uint8_t* d, size_t n) override {
-    if (failRead) return false;
+    if (failRead || failReadAt.count({id, off})) return false;
     auto it = segs.find(id);
     if (it == segs.end() || off + n > it->second.size()) return false;
     memcpy(d, it->second.data() + off, n);
@@ -71,7 +74,7 @@ static Reading mk(uint32_t epoch) {
   r.epoch = epoch;
   r.tempCenti = static_cast<int16_t>(epoch % 1000) - 300;
   r.humCenti = 5000;
-  r.stationDeciPa = 9920000;
+  r.stationDeciPa = 992000;
   return r;
 }
 
@@ -305,6 +308,82 @@ void test_queue_torn_first_append_reuses_segment() {
   TEST_ASSERT_EQUAL_UINT32(0, q.corrupt());
 }
 
+// Calls front() until it returns a reading, at most `tries` times; the call count in `calls`.
+static bool frontWithin(ReadingQueue& q, int tries, Reading& r, int& calls) {
+  for (calls = 1; calls <= tries; ++calls) {
+    if (q.front(r)) return true;
+  }
+  return false;
+}
+
+void test_queue_record_that_never_reads_is_skipped() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  for (uint32_t i = 1; i <= 6; ++i) q.push(mk(i * 300));
+  s.failReadAt.insert({1, kRecordSize});  // the second record
+  TEST_ASSERT_EQUAL_UINT32(1, drain(q, nullptr, 1));
+  Reading r;
+  int calls;
+  TEST_ASSERT_TRUE(frontWithin(q, 10, r, calls));
+  TEST_ASSERT_EQUAL(static_cast<int>(ReadingQueue::kReadFailsBeforeSkip), calls);
+  TEST_ASSERT_EQUAL_UINT32(900, r.epoch);
+  TEST_ASSERT_EQUAL_UINT32(1, q.unreadable());
+  std::vector<uint32_t> got;
+  drain(q, &got);
+  TEST_ASSERT_EQUAL(4, (int)got.size());
+}
+
+void test_queue_unreadable_segment_is_skipped() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  for (uint32_t i = 1; i <= 6; ++i) q.push(mk(i * 300));
+  for (uint32_t k = 0; k < 4; ++k) s.failReadAt.insert({1, k * kRecordSize});
+  Reading r;
+  int calls;
+  TEST_ASSERT_TRUE(frontWithin(q, 10, r, calls));
+  TEST_ASSERT_EQUAL_UINT32(1500, r.epoch);
+  TEST_ASSERT_EQUAL_UINT32(4, q.unreadable());
+  drain(q);
+  TEST_ASSERT_EQUAL(0, (int)s.segs.count(1));
+}
+
+void test_queue_store_down_loses_nothing() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  for (uint32_t i = 1; i <= 12; ++i) q.push(mk(i * 300));
+  s.failRead = true;
+  Reading r;
+  int calls;
+  TEST_ASSERT_FALSE(frontWithin(q, 100, r, calls));
+  q.commit();
+  TEST_ASSERT_EQUAL_UINT32(12, q.pending());
+  TEST_ASSERT_EQUAL_UINT32(0, q.unreadable());
+}
+
+void test_queue_newest() {
+  MemStore s;
+  ReadingQueue q(s, 4, 10);
+  q.begin();
+  Reading r, f;
+  TEST_ASSERT_FALSE(q.newest(r));
+  for (uint32_t i = 1; i <= 6; ++i) q.push(mk(i * 300));
+  TEST_ASSERT_TRUE(q.front(f));
+  TEST_ASSERT_TRUE(q.newest(r));
+  TEST_ASSERT_EQUAL_UINT32(1800, r.epoch);
+  q.pop();  // still pops what front() returned
+  TEST_ASSERT_TRUE(q.front(r));
+  TEST_ASSERT_EQUAL_UINT32(600, r.epoch);
+  auto& last = s.segs[2];
+  last[last.size() - 3] ^= 0xFF;  // damage the last record
+  TEST_ASSERT_TRUE(q.newest(r));
+  TEST_ASSERT_EQUAL_UINT32(1500, r.epoch);
+  drain(q);
+  TEST_ASSERT_FALSE(q.newest(r));
+}
+
 // ---- time -----------------------------------------------------------------------------
 
 void test_iso_local_with_offset() {
@@ -341,17 +420,27 @@ void test_body() {
   Reading r = mk(1794128400);
   r.tempCenti = -5;
   r.humCenti = 10000;
-  r.stationDeciPa = 9920000;  // 992.000 hPa
+  r.stationDeciPa = 992000;  // 992.000 hPa (0.1 Pa units)
   Calibration cal{298.0, -3.2};
   char b[160];
   TEST_ASSERT_TRUE(buildBody(r, cal, b, sizeof b) > 0);
-  char expect[160];
-  char p[16];
-  formatCenti(seaLevelCentiHpa(r, cal), p, sizeof p);
-  snprintf(expect, sizeof expect,
-           "{\"timestamp\":\"2026-11-08T10:00:00+01:00\",\"temperature\":-0.05,\"humidity\":100.00,\"pressure\":%s}", p);
-  TEST_ASSERT_EQUAL_STRING(expect, b);
+  // 988.8 hPa at -0.05 degC, 100 %, 298 m, computed independently in Python.
+  TEST_ASSERT_EQUAL_STRING(
+      "{\"timestamp\":\"2026-11-08T10:00:00+01:00\",\"temperature\":-0.05,\"humidity\":100.00,\"pressure\":1026.12}", b);
   TEST_ASSERT_EQUAL(0, (int)buildBody(r, cal, b, 20));  // too small: refuse, never truncate
+}
+
+void test_app_accepts() {
+  Calibration cal{298.0, -3.2};
+  Reading r = mk(300);
+  r.tempCenti = 1500;
+  r.stationDeciPa = 980000;
+  TEST_ASSERT_TRUE(appAccepts(r, cal));
+  r.tempCenti = 6001;  // the sensor allows up to 85 degC, the app 60
+  TEST_ASSERT_FALSE(appAccepts(r, cal));
+  r.tempCenti = 1500;
+  r.stationDeciPa = 1070000;  // ~1106 hPa at sea level
+  TEST_ASSERT_FALSE(appAccepts(r, cal));
 }
 
 void test_format_centi() {
@@ -434,6 +523,11 @@ int main() {
   RUN_TEST(test_queue_read_error_keeps_backlog);
   RUN_TEST(test_queue_repeated_write_failures_keep_data);
   RUN_TEST(test_queue_torn_first_append_reuses_segment);
+  RUN_TEST(test_queue_record_that_never_reads_is_skipped);
+  RUN_TEST(test_queue_unreadable_segment_is_skipped);
+  RUN_TEST(test_queue_store_down_loses_nothing);
+  RUN_TEST(test_queue_newest);
+  RUN_TEST(test_app_accepts);
   RUN_TEST(test_iso_local_with_offset);
   RUN_TEST(test_iso_dst_fold_is_unambiguous);
   RUN_TEST(test_days_from_civil);

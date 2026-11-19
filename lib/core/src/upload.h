@@ -20,6 +20,13 @@ enum class Outcome {
 
 Outcome classifyResponse(int httpStatus);
 
+// What the weather app accepts (dwzg/weatherpage, app/models.py: temperature
+// -90..60 degC, humidity 0..100 %, sea-level pressure 800..1100 hPa), with the
+// lower temperature bound at the sensors' -40 degC. Readings outside are not
+// queued: the app would refuse them, and a refusal is how the uploader
+// recognises a broken app.
+bool appAccepts(const Reading& r, const Calibration& cal);
+
 // Sea-level pressure in 0.01 hPa for a stored reading.
 int32_t seaLevelCentiHpa(const Reading& r, const Calibration& cal);
 

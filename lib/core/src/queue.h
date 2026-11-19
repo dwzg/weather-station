@@ -39,8 +39,12 @@ class ReadingQueue {
   bool begin();
   bool push(const Reading& r);
   // Oldest undelivered reading. Skips records that fail their CRC; returns
-  // false (without skipping anything) when the store cannot be read.
+  // false (without skipping anything) when the store cannot be read. A record
+  // whose reads fail kReadFailsBeforeSkip times in a row is skipped, but only
+  // if what follows it reads: a store that is down loses nothing.
   bool front(Reading& out);
+  // Newest pending reading, without moving the cursor or affecting pop().
+  bool newest(Reading& out);
   void pop();                // marks the reading front() returned as delivered
   bool commit();             // persists the cursor and deletes delivered segments
 
@@ -48,6 +52,9 @@ class ReadingQueue {
   uint32_t dropped() const { return dropped_; }
   uint32_t corrupt() const { return corrupt_; }
   uint32_t readErrors() const { return readErrors_; }
+  uint32_t unreadable() const { return unreadable_; }  // skipped: their flash could not be read
+
+  static constexpr uint32_t kReadFailsBeforeSkip = 5;
   size_t segments() const { return segs_.size(); }
   uint32_t oldestEpochHint() const { return frontEpoch_; }  // epoch of the last front(), 0 if none
 
@@ -60,6 +67,8 @@ class ReadingQueue {
 
   int cursorIndex() const;  // index into segs_ of the cursor segment, -1 if none
   void dropOldest();
+  bool readable(uint32_t id, uint32_t idx);
+  bool skipUnreadable(size_t i);
 
   SegmentStore& store_;
   const uint16_t perSegment_;
@@ -71,6 +80,11 @@ class ReadingQueue {
   uint32_t dropped_ = 0;
   uint32_t corrupt_ = 0;
   uint32_t readErrors_ = 0;
+  uint32_t unreadable_ = 0;
+  bool readFailValid_ = false;  // reads last failed at readFailSeg_/readFailIdx_ ...
+  uint32_t readFailSeg_ = 0;
+  uint32_t readFailIdx_ = 0;
+  uint32_t readFails_ = 0;  // ... this often in a row
   uint32_t frontEpoch_ = 0;
   bool frontValid_ = false;
   bool dirty_ = false;

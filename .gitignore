@@ -2,3 +2,8 @@
 include/secrets.h
 *.bin
 *.bin.gz
+rust/*/target/
+rust/firmware/.embuild/
+rust/firmware/secrets.env
+rust/firmware/sdkconfig
+rust/firmware/components_*.lock

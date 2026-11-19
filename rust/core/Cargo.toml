@@ -1,0 +1,12 @@
+[package]
+name = "ws-core"
+version = "0.1.0"
+edition = "2021"
+description = "Hardware-free logic of the weather station: queue, record format, time, pressure, upload policy, sensor drivers"
+publish = false
+
+[dependencies]
+embedded-hal = "1.0"
+hmac = "0.13"
+log = "0.4"
+sha2 = { version = "0.11", default-features = false }

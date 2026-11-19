@@ -21,9 +21,6 @@ namespace {
 // the next slot, so an upload cannot push a measurement out of its window.
 constexpr uint32_t kStopBeforeSlotS = 70;
 constexpr uint32_t kStartAfterSlotS = 3;
-// After this many rejected readings in a row the app is more likely broken than
-// the readings: stop dropping them and wait for a person.
-constexpr uint8_t kRejectsBeforeHalt = 3;
 
 uint32_t secondsToNextSlot() {
   const time_t now = time(nullptr);
@@ -55,6 +52,40 @@ void Uploader::loop(bool wifiUp, bool timeValid) {
   }
   if (!inUploadWindow()) return;
   sendBatch();
+}
+
+Uploader::Probe Uploader::probe(HTTPClient& http, BearSSL::WiFiClientSecure& client, const ws::Reading& refused) {
+  // The app upserts on the timestamp, so sending the newest reading early (it
+  // is sent again in its turn) does no harm.
+  ws::Reading newest;
+  if (!q_->newest(newest) || newest.epoch == refused.epoch) {
+    snprintf(st_.lastError, sizeof st_.lastError, "app refused the newest reading; waiting for a newer one");
+    return Probe::NoAnswer;
+  }
+  char body[192];
+  if (!ws::buildBody(newest, cal_, body, sizeof body) || !http.begin(client, API_URL)) {
+    snprintf(st_.lastError, sizeof st_.lastError, "cannot ask the app about the newest reading");
+    return Probe::NoAnswer;
+  }
+  http.addHeader(F("Content-Type"), F("application/json"));
+  http.addHeader(F("X-API-Key"), F(API_KEY));
+  const int code = http.POST(reinterpret_cast<uint8_t*>(body), strlen(body));
+  st_.lastStatus = code;
+  if (code > 0) http.getString();  // read it all, so the connection can carry on
+  switch (ws::classifyResponse(code)) {
+    case ws::Outcome::Accepted:
+      st_.lastOkEpoch = static_cast<uint32_t>(time(nullptr));
+      return Probe::AppWorks;
+    case ws::Outcome::Retry:
+      if (code > 0) {
+        snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d", code);
+      } else {
+        snprintf(st_.lastError, sizeof st_.lastError, "%s", HTTPClient::errorToString(code).c_str());
+      }
+      return Probe::NoAnswer;
+    default:
+      return Probe::AppRefuses;
+  }
 }
 
 void Uploader::sendBatch() {
@@ -110,25 +141,33 @@ void Uploader::sendBatch() {
     if (!st_.minHeapInTls || heap < st_.minHeapInTls) st_.minHeapInTls = heap;
     String resp = code > 0 ? http.getString() : String();
 
-    ws::Outcome outcome = ws::classifyResponse(code);
-    if (outcome == ws::Outcome::Rejected && rejectsInARow_ + 1 >= kRejectsBeforeHalt) {
-      outcome = ws::Outcome::Halt;  // keep this one and everything behind it
-    }
-    switch (outcome) {
+    switch (ws::classifyResponse(code)) {
       case ws::Outcome::Accepted:
         q_->pop();
         ++sent;
         ++st_.accepted;
-        rejectsInARow_ = 0;
         st_.lastOkEpoch = static_cast<uint32_t>(time(nullptr));
         st_.lastError[0] = '\0';
         continue;
       case ws::Outcome::Rejected:
-        logf("upload: app rejected %.90s -> %d %.60s", body, code, resp.c_str());
-        q_->pop();
-        ++st_.rejected;
-        ++rejectsInARow_;
-        continue;
+        // Bad data, or a broken app (or a firmware sending a body the app no
+        // longer takes)? Dropping is right only for bad data: ask about another.
+        switch (probe(http, client, r)) {
+          case Probe::AppWorks:
+            logf("upload: app rejected %.80s -> %d %.40s; it takes the newest reading, so this one goes", body, code,
+                 resp.c_str());
+            q_->pop();
+            ++st_.rejected;
+            continue;
+          case Probe::AppRefuses:
+            snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d %.24s (the newest reading too)", code, resp.c_str());
+            halted = true;
+            break;
+          case Probe::NoAnswer:  // lastError says why
+            failed = true;
+            break;
+        }
+        break;
       case ws::Outcome::Halt:
         snprintf(st_.lastError, sizeof st_.lastError, "HTTP %d %.40s", code, resp.c_str());
         halted = true;

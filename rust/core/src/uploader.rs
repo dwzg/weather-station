@@ -1,0 +1,516 @@
+//! Sends the queue, oldest first, to the weather app. A reading leaves the
+//! queue only once the app has answered 2xx (or rejected it for good).
+//!
+//! The HTTP client is behind [`Transport`], so the policy (batches, the upload
+//! window, what each answer means, backoff) is tested on the host.
+
+use log::{info, warn};
+
+use crate::backoff::Backoff;
+use crate::queue::{ReadingQueue, SegmentStore};
+use crate::reading::Reading;
+use crate::timefmt::TimeZone;
+use crate::upload::{build_body, classify_response, Calibration, Outcome};
+
+/// An HTTP answer.
+#[derive(Clone, Debug, Default)]
+pub struct Response {
+    pub status: u16,
+    pub body: String,
+}
+
+/// One connection to the app (kept alive across the requests of a batch).
+pub trait Transport {
+    /// POSTs one JSON body. Err with a short description when there is no HTTP
+    /// answer at all (DNS, TCP, TLS, timeout).
+    fn post(&mut self, body: &str) -> Result<Response, String>;
+}
+
+impl<T: Transport + ?Sized> Transport for &mut T {
+    fn post(&mut self, body: &str) -> Result<Response, String> {
+        (**self).post(body)
+    }
+}
+
+/// The clock and randomness the uploader needs.
+pub trait Env {
+    /// Monotonic milliseconds since boot.
+    fn now_ms(&self) -> u64;
+    /// Wall clock, seconds since 1970 (only called while the clock is valid).
+    fn epoch(&self) -> u32;
+    fn random(&mut self) -> u32;
+}
+
+#[derive(Clone, Debug)]
+pub struct UploadConfig {
+    pub cal: Calibration,
+    pub tz: TimeZone,
+    pub slot_s: u32,
+    /// Readings per connection...
+    pub batch_max: u32,
+    /// ...and at most this long.
+    pub batch_budget_ms: u64,
+    pub retry_min_ms: u32,
+    pub retry_max_ms: u32,
+    /// After 3xx/401/403/404/...: someone has to fix the config.
+    pub halt_ms: u32,
+    /// The slowest single request (DNS, connect, handshake, headers, body, each
+    /// with its own timeout) takes about a minute. Never start one later than
+    /// this before the next slot, so an upload cannot push a measurement out of
+    /// its window.
+    pub stop_before_slot_s: u32,
+    pub start_after_slot_s: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UploadStats {
+    pub accepted: u32,
+    pub rejected: u32,
+    pub failed_batches: u32,
+    /// Wall clock of the last accepted reading.
+    pub last_ok_epoch: u32,
+    /// HTTP status of the last request, 0 if it got no answer.
+    pub last_status: u16,
+    pub last_error: String,
+    pub last_batch_ms: u64,
+}
+
+pub struct Uploader {
+    cfg: UploadConfig,
+    backoff: Backoff,
+    paused_until_ms: Option<u64>,
+    stats: UploadStats,
+}
+
+fn clip(s: &str, n: usize) -> &str {
+    s.char_indices().nth(n).map_or(s, |(i, _)| &s[..i])
+}
+
+impl Uploader {
+    pub fn new(cfg: UploadConfig) -> Self {
+        let backoff = Backoff::new(cfg.retry_min_ms, cfg.retry_max_ms);
+        Self { cfg, backoff, paused_until_ms: None, stats: UploadStats::default() }
+    }
+
+    pub fn stats(&self) -> &UploadStats {
+        &self.stats
+    }
+
+    pub fn retry_in_ms(&self, now_ms: u64) -> u64 {
+        self.paused_until_ms.map_or(0, |t| t.saturating_sub(now_ms))
+    }
+
+    fn pause(&mut self, now_ms: u64, ms: u32) {
+        self.paused_until_ms = Some(now_ms + u64::from(ms));
+    }
+
+    /// True between `start_after_slot_s` after a slot and `stop_before_slot_s` before the next.
+    pub fn in_window(&self, epoch: u32) -> bool {
+        let to_next = self.cfg.slot_s - epoch % self.cfg.slot_s;
+        to_next >= self.cfg.stop_before_slot_s && to_next <= self.cfg.slot_s - self.cfg.start_after_slot_s
+    }
+
+    /// Whether [`poll`](Self::poll) would send now. Lets the caller skip setting
+    /// up a connection.
+    pub fn due<S: SegmentStore>(&self, q: &ReadingQueue<S>, ready: bool, env: &impl Env) -> bool {
+        ready
+            && q.pending() > 0
+            && self.paused_until_ms.is_none_or(|t| env.now_ms() >= t)
+            && self.in_window(env.epoch())
+    }
+
+    /// Sends a batch if one is due. `ready`: network up and clock valid.
+    /// `connect` sets up the transport for one batch.
+    pub fn poll<S, T, F>(&mut self, q: &mut ReadingQueue<S>, ready: bool, env: &mut impl Env, connect: F)
+    where
+        S: SegmentStore,
+        T: Transport,
+        F: FnOnce() -> Result<T, String>,
+    {
+        if !self.due(q, ready, env) {
+            return;
+        }
+        self.paused_until_ms = None;
+        let started = env.now_ms();
+        match connect() {
+            Ok(mut t) => self.send_batch(q, env, &mut t, started),
+            Err(e) => {
+                self.stats.failed_batches += 1;
+                let wait = self.backoff.next(env.random());
+                self.pause(started, wait);
+                warn!("upload: {e}, retry in {}s", wait / 1000);
+                self.stats.last_error = e;
+            }
+        }
+    }
+
+    fn send_batch<S: SegmentStore, T: Transport>(
+        &mut self,
+        q: &mut ReadingQueue<S>,
+        env: &mut impl Env,
+        t: &mut T,
+        started: u64,
+    ) {
+        let mut sent = 0u32;
+        let mut failed = false;
+        let mut halted = false;
+        let mut read_failed = false;
+        while sent < self.cfg.batch_max
+            && env.now_ms() - started < self.cfg.batch_budget_ms
+            && self.in_window(env.epoch())
+        {
+            let Some(r) = q.front() else {
+                read_failed = q.pending() > 0; // front() refuses without skipping on a read error
+                break;
+            };
+            let body = build_body(&r, &self.cfg.cal, &self.cfg.tz);
+            let resp = match t.post(&body) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.stats.last_status = 0;
+                    self.stats.last_error = e;
+                    failed = true;
+                    break;
+                }
+            };
+            self.stats.last_status = resp.status;
+            match classify_response(i32::from(resp.status)) {
+                Outcome::Accepted => {
+                    q.pop();
+                    sent += 1;
+                    self.stats.accepted += 1;
+                    self.stats.last_ok_epoch = env.epoch();
+                    self.stats.last_error.clear();
+                }
+                // A refused reading is either bad data or a broken app (or a
+                // firmware sending a body the app no longer takes). Dropping it
+                // is right only in the first case: ask the app about another one.
+                Outcome::Rejected => match self.probe(q, t, &r, env) {
+                    Probe::AppWorks => {
+                        warn!(
+                            "upload: app rejected {} -> {} {}; it takes the newest reading, so this one goes",
+                            clip(&body, 90),
+                            resp.status,
+                            clip(&resp.body, 60)
+                        );
+                        q.pop();
+                        self.stats.rejected += 1;
+                    }
+                    Probe::AppRefuses => {
+                        self.stats.last_error =
+                            format!("HTTP {} {} (the newest reading too)", resp.status, clip(&resp.body, 40));
+                        halted = true;
+                        break;
+                    }
+                    Probe::NoAnswer(e) => {
+                        self.stats.last_error = e;
+                        failed = true;
+                        break;
+                    }
+                },
+                Outcome::Halt => {
+                    self.stats.last_error =
+                        format!("HTTP {} {}", resp.status, clip(&resp.body, 40)).trim_end().to_string();
+                    halted = true;
+                    break;
+                }
+                Outcome::Retry => {
+                    self.stats.last_error = format!("HTTP {}", resp.status);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if !q.commit() {
+            warn!("upload: could not save the queue cursor (readings will be sent again)");
+        }
+        let now = env.now_ms();
+        self.stats.last_batch_ms = now - started;
+
+        if halted {
+            self.stats.failed_batches += 1;
+            self.pause(now, self.cfg.halt_ms);
+            warn!(
+                "upload: {}; needs a fix (URL, key or app), pausing {} min",
+                self.stats.last_error,
+                self.cfg.halt_ms / 60_000
+            );
+        } else if failed {
+            self.stats.failed_batches += 1;
+            let wait = self.backoff.next(env.random());
+            self.pause(now, wait);
+            warn!(
+                "upload: {} after {sent} sent, {} pending, retry in {}s",
+                self.stats.last_error,
+                q.pending(),
+                wait / 1000
+            );
+        } else if read_failed {
+            self.stats.last_error = format!("queue read error ({})", q.read_errors());
+            let wait = self.backoff.next(env.random());
+            self.pause(now, wait);
+            warn!("upload: {}, retry in {}s", self.stats.last_error, wait / 1000);
+        } else {
+            self.backoff.reset();
+            if sent > 1 || q.pending() > 0 {
+                info!("upload: {sent} sent in {}ms, {} pending", now - started, q.pending());
+            }
+        }
+    }
+}
+
+/// What the app says about the newest reading after it refused an older one.
+enum Probe {
+    /// Accepted: the app works, the refused reading is bad.
+    AppWorks,
+    /// Refused too: the app (or what this firmware sends) is broken.
+    AppRefuses,
+    /// Could not tell (no answer, 5xx, or no other reading to ask about).
+    NoAnswer(String),
+}
+
+impl Uploader {
+    fn probe<S: SegmentStore, T: Transport>(
+        &mut self,
+        q: &mut ReadingQueue<S>,
+        t: &mut T,
+        refused: &Reading,
+        env: &impl Env,
+    ) -> Probe {
+        // The app upserts on the timestamp, so sending the newest reading early
+        // (it is sent again in its turn) does no harm.
+        let Some(newest) = q.newest().filter(|n| n.epoch != refused.epoch) else {
+            return Probe::NoAnswer("app refused the newest reading; waiting for a newer one".into());
+        };
+        match t.post(&build_body(&newest, &self.cfg.cal, &self.cfg.tz)) {
+            Err(e) => Probe::NoAnswer(e),
+            Ok(resp) => {
+                self.stats.last_status = resp.status;
+                match classify_response(i32::from(resp.status)) {
+                    Outcome::Accepted => {
+                        self.stats.last_ok_epoch = env.epoch();
+                        Probe::AppWorks
+                    }
+                    Outcome::Retry => Probe::NoAnswer(format!("HTTP {}", resp.status)),
+                    Outcome::Rejected | Outcome::Halt => Probe::AppRefuses,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::queue::MemStore;
+    use crate::reading::Reading;
+
+    /// Starts 10 s into a slot; every request takes `step_ms`.
+    struct FakeEnv {
+        ms: Rc<Cell<u64>>,
+        epoch0: u32,
+    }
+    impl Env for FakeEnv {
+        fn now_ms(&self) -> u64 {
+            self.ms.get()
+        }
+        fn epoch(&self) -> u32 {
+            self.epoch0 + (self.ms.get() / 1000) as u32
+        }
+        fn random(&mut self) -> u32 {
+            0
+        }
+    }
+
+    struct FakeTransport {
+        answers: Vec<Result<u16, String>>,
+        bodies: Vec<String>,
+        ms: Rc<Cell<u64>>,
+        step_ms: u64,
+    }
+    impl Transport for FakeTransport {
+        fn post(&mut self, body: &str) -> Result<Response, String> {
+            self.ms.set(self.ms.get() + self.step_ms);
+            self.bodies.push(body.to_string());
+            let a = if self.answers.is_empty() { Ok(200) } else { self.answers.remove(0) };
+            a.map(|status| Response { status, body: String::new() })
+        }
+    }
+
+    fn cfg() -> UploadConfig {
+        UploadConfig {
+            cal: Calibration { altitude_m: 298.0, pressure_offset_hpa: -3.2 },
+            tz: TimeZone::parse("CET-1CEST,M3.5.0,M10.5.0/3").unwrap(),
+            slot_s: 300,
+            batch_max: 40,
+            batch_budget_ms: 25_000,
+            retry_min_ms: 15_000,
+            retry_max_ms: 600_000,
+            halt_ms: 1_800_000,
+            stop_before_slot_s: 70,
+            start_after_slot_s: 3,
+        }
+    }
+
+    const SLOT: u32 = 1_794_128_400;
+
+    fn setup(n: u32) -> (Uploader, ReadingQueue<MemStore>, FakeEnv, Rc<Cell<u64>>) {
+        let mut q = ReadingQueue::new(MemStore::persistent(), 288, 60);
+        assert!(q.begin());
+        for i in 0..n {
+            q.push(&Reading {
+                epoch: SLOT - 300 * (n - i),
+                temp_centi: 700,
+                hum_centi: 8000,
+                station_deci_pa: 990_000,
+                source: 0,
+            });
+        }
+        let ms = Rc::new(Cell::new(0));
+        (Uploader::new(cfg()), q, FakeEnv { ms: ms.clone(), epoch0: SLOT + 10 }, ms)
+    }
+
+    fn transport(ms: &Rc<Cell<u64>>, answers: Vec<Result<u16, String>>) -> FakeTransport {
+        FakeTransport { answers, bodies: Vec::new(), ms: ms.clone(), step_ms: 100 }
+    }
+
+    #[test]
+    fn sends_oldest_first_and_stops_at_batch_max() {
+        let (mut u, mut q, mut env, ms) = setup(50);
+        let mut t = transport(&ms, vec![]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(t.bodies.len(), 40);
+        assert!(t.bodies[0].contains("\"timestamp\":\"2026-11-08T05:50:00+01:00\""), "{}", t.bodies[0]);
+        assert_eq!(q.pending(), 10);
+        assert_eq!(u.stats().accepted, 40);
+        // Delivered readings are durable: a "reboot" resumes behind them.
+        let store = std::mem::take(q.store_mut());
+        let mut q2 = ReadingQueue::new(store, 288, 60);
+        q2.begin();
+        assert_eq!(q2.pending(), 10);
+    }
+
+    #[test]
+    fn nothing_without_network_or_outside_the_window() {
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![]);
+        u.poll(&mut q, false, &mut env, || Ok(&mut t));
+        assert!(t.bodies.is_empty());
+        env.epoch0 = SLOT + 300 - 60; // a minute before the next measurement
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert!(t.bodies.is_empty());
+        env.epoch0 = SLOT + 1; // right at the measurement
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert!(t.bodies.is_empty());
+        assert_eq!(q.pending(), 3);
+    }
+
+    #[test]
+    fn batch_ends_when_the_window_closes() {
+        let (mut u, mut q, mut env, ms) = setup(40);
+        env.epoch0 = SLOT + 300 - 75; // requests may start until 70 s before the slot
+        let mut t = transport(&ms, vec![]);
+        t.step_ms = 1000;
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(t.bodies.len(), 6);
+    }
+
+    #[test]
+    fn retry_keeps_the_reading_and_backs_off() {
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(200), Ok(503)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(q.pending(), 2);
+        assert_eq!(u.stats().last_error, "HTTP 503");
+        assert_eq!(u.retry_in_ms(ms.get()), 11_250); // 15 s - 25 % (random = 0)
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(t.bodies.len(), 2, "paused");
+        ms.set(ms.get() + 11_250);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(q.pending(), 0);
+        assert!(t.bodies[1] == t.bodies[2], "the failed reading is sent again");
+        assert!(u.stats().last_error.is_empty());
+    }
+
+    #[test]
+    fn transport_error_is_a_retry() {
+        let (mut u, mut q, mut env, ms) = setup(2);
+        let mut t = transport(&ms, vec![Err("TLS handshake failed".into())]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(q.pending(), 2);
+        assert_eq!(u.stats().last_status, 0);
+        assert_eq!(u.stats().failed_batches, 1);
+        assert!(u.retry_in_ms(ms.get()) > 0);
+        let (mut u, mut q, mut env, _) = setup(2);
+        u.poll::<_, &mut FakeTransport, _>(&mut q, true, &mut env, || Err("out of memory".into()));
+        assert_eq!(u.stats().last_error, "out of memory");
+        assert!(u.retry_in_ms(0) > 0);
+    }
+
+    #[test]
+    fn halt_keeps_everything_and_waits_long() {
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(401)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!(q.pending(), 3);
+        assert_eq!(u.retry_in_ms(ms.get()), 1_800_000);
+        assert_eq!(u.stats().last_error, "HTTP 401");
+    }
+
+    #[test]
+    fn rejected_reading_goes_when_the_app_takes_the_newest() {
+        let (mut u, mut q, mut env, ms) = setup(5);
+        // r1 refused, probe (r5) taken -> r1 dropped; r2 ok; r3 refused, probe taken; r4, r5 ok.
+        let mut t = transport(&ms, vec![Ok(422), Ok(200), Ok(200), Ok(422), Ok(201), Ok(200), Ok(200)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, u.stats().accepted, q.pending()), (2, 3, 0));
+        assert_eq!(t.bodies.len(), 7);
+        assert_eq!(t.bodies[1], t.bodies[6], "the probe is the newest reading");
+        assert_eq!(t.bodies[4], t.bodies[6]);
+    }
+
+    #[test]
+    fn broken_app_loses_nothing() {
+        let (mut u, mut q, mut env, ms) = setup(5);
+        let mut t = transport(&ms, vec![Ok(422), Ok(422)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, q.pending()), (0, 5));
+        assert_eq!(u.retry_in_ms(ms.get()), 1_800_000);
+        assert!(u.stats().last_error.contains("newest reading too"), "{}", u.stats().last_error);
+        // Still broken half an hour later: still nothing dropped.
+        ms.set(ms.get() + 1_800_000);
+        env.epoch0 -= 1800; // stay in the upload window
+        t.answers = vec![Ok(400), Ok(400)];
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, q.pending(), t.bodies.len()), (0, 5, 4));
+    }
+
+    #[test]
+    fn refused_newest_reading_waits_for_a_newer_one() {
+        let (mut u, mut q, mut env, ms) = setup(1);
+        let mut t = transport(&ms, vec![Ok(422)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((q.pending(), t.bodies.len()), (1, 1), "nothing to ask about, nothing dropped");
+        assert!(u.retry_in_ms(ms.get()) < 1_800_000, "a short wait, not a halt");
+        // The probe itself gets no answer: keep, retry.
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(422), Err("timeout".into())]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((q.pending(), u.stats().last_error.as_str()), (3, "timeout"));
+    }
+
+    #[test]
+    fn read_error_backs_off_without_losing_data() {
+        let (mut u, mut q, mut env, ms) = setup(3);
+        q.store_mut().fail_read = true;
+        let mut t = transport(&ms, vec![]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert!(t.bodies.is_empty());
+        assert!(u.stats().last_error.starts_with("queue read error"));
+        assert!(u.retry_in_ms(ms.get()) > 0);
+        assert_eq!(q.pending(), 3);
+    }
+}
