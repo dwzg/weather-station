@@ -23,7 +23,7 @@ use esp_idf_svc::sntp::{EspSntp, SntpConf};
 use esp_idf_svc::sys;
 use esp_idf_svc::timer::EspTaskTimerService;
 use log::{info, warn};
-use ws_core::boot::{self, Mode, RtcState};
+use ws_core::boot::{self, Mode, ResetKind, RtcState};
 use ws_core::json::JsonObject;
 use ws_core::queue::{MemStore, ReadingQueue, SegmentStore};
 use ws_core::reading::{Reading, SOURCE_SHT4X};
@@ -415,16 +415,36 @@ fn run(tz: TimeZone) -> anyhow::Result<std::convert::Infallible> {
     );
 
     // A crash or update resets the CPU but not the RTC: ESP-IDF keeps the system
-    // time across it. If it did not, restore it from RTC memory, off by the reboot
-    // time (~1 s plus up to RTC_SAVE_MS) until the next NTP sync.
+    // time across it. After esp_restart() that time is exact (a shutdown handler
+    // syncs the RTC counter with the crystal-timed clock first). After a panic or
+    // watchdog reset it is not: it then comes from the RTC counter alone, which
+    // runs on the RC oscillator and has drifted for the whole uptime (minutes
+    // after weeks). RTC memory holds a crystal-timed epoch at most RTC_SAVE_MS
+    // old, so after those resets the kept time is used only if it agrees with it;
+    // otherwise the saved epoch is used, off by the reboot time (~1 s plus up to
+    // RTC_SAVE_MS) until the next NTP sync.
     let mut clock_restored = false;
-    if b.state_kept && platform::epoch() > platform::SANE_EPOCH {
+    let kept = platform::epoch();
+    let saved = if b.state_kept { b.state.epoch } else { 0 };
+    let estimate = saved.saturating_add(2 + (config::RTC_SAVE_MS / 2000) as u32);
+    let slack = (config::RTC_SAVE_MS / 1000) as u32 + 10;
+    if b.state_kept
+        && kept > platform::SANE_EPOCH
+        && (kind == ResetKind::Software || saved <= platform::SANE_EPOCH || kept.abs_diff(estimate) <= slack)
+    {
         clock_restored = true;
         info!("clock: kept across the reset");
-    } else if b.state_kept && b.state.epoch > platform::SANE_EPOCH {
-        platform::set_epoch(b.state.epoch + 2 + (config::RTC_SAVE_MS / 2000) as u32);
+    } else if saved > platform::SANE_EPOCH {
+        platform::set_epoch(estimate);
         clock_restored = true;
-        info!("clock: restored from RTC memory");
+        if kept > platform::SANE_EPOCH {
+            info!(
+                "clock: kept time was off by {} s after the reset; restored from RTC memory",
+                kept.abs_diff(estimate)
+            );
+        } else {
+            info!("clock: restored from RTC memory");
+        }
     }
     if clock_restored {
         platform::trust_clock();
