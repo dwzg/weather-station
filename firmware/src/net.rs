@@ -14,10 +14,10 @@ use crate::{config, platform};
 /// ISRG Root X1, X2 and the 2025 generation YR, YE; mbedTLS parses all PEM
 /// blocks of the buffer. NUL-terminated as ESP-IDF wants it.
 static TRUST_ANCHORS: &[u8] = concat!(
-    include_str!("../../../certs/isrgrootx1.pem"),
-    include_str!("../../../certs/isrg-root-x2.pem"),
-    include_str!("../../../certs/root-ye.pem"),
-    include_str!("../../../certs/root-yr.pem"),
+    include_str!("../../certs/isrgrootx1.pem"),
+    include_str!("../../certs/isrg-root-x2.pem"),
+    include_str!("../../certs/root-ye.pem"),
+    include_str!("../../certs/root-yr.pem"),
     "\0"
 )
 .as_bytes();

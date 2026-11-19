@@ -8,7 +8,7 @@
 //!
 //! The station checks the tag before it writes anything, and the image against
 //! the hash before it boots it. The key is SHA-256 of the OTA password; only the
-//! key is in the firmware. tools/ota-s2.py is the other side.
+//! key is in the firmware. tools/ota.py is the other side.
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -120,7 +120,7 @@ mod tests {
         assert!(!verify(&key, "abc", &sha, 9, &t));
         assert!(!verify(&key_from_password("wrong"), "abc", &sha, 8, &t));
         assert!(!verify(&key, "abc", &sha, 8, "zz"));
-        // Fixed vector, shared with tools/ota-s2.py's self-test.
+        // Fixed vector, shared with tools/ota.py's self-test.
         assert_eq!(
             to_hex(&tag(&key_from_password("pw"), "00112233445566778899aabbccddeeff", &"0".repeat(64), 1234)),
             TOOL_VECTOR

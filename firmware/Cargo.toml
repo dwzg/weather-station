@@ -29,7 +29,7 @@ ws-core = { path = "../core" }
 [build-dependencies]
 embuild = "0.33"
 
-# LittleFS for the reading queue (the ESP8266 build used it too): power-loss
+# LittleFS for the reading queue: power-loss
 # safe, with atomic rename for the cursor.
 [[package.metadata.esp-idf-sys.extra_components]]
 remote_component = { name = "joltwallet/littlefs", version = "1.23.1" }

@@ -3,33 +3,18 @@ on:
   push:
   pull_request:
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: actions/cache@v4
-        with:
-          path: ~/.platformio
-          key: pio-${{ hashFiles('platformio.ini') }}
-      - run: pip install platformio==6.2.0
-      - run: pio test -e native
-      - run: cp include/secrets.example.h include/secrets.h && pio run -e station
-
-  rust-core:
+  core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal --component clippy
       - run: cargo test
-        working-directory: rust/core
+        working-directory: core
       - run: cargo clippy --all-targets -- -D warnings
-        working-directory: rust/core
-      - run: python3 tools/ota-s2.py --self-test | grep -q 582918a97d97d3d3c90c3078b02e5bc955296f0c82e56ff00f4a07148f3011b4
+        working-directory: core
+      - run: python3 tools/ota.py --self-test | grep -q 582918a97d97d3d3c90c3078b02e5bc955296f0c82e56ff00f4a07148f3011b4
 
-  rust-firmware:
+  firmware:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,8 +26,8 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.espressif
-          key: esp-idf-v5.5.5-esp32s2-${{ hashFiles('rust/firmware/sdkconfig.defaults') }}
+          key: esp-idf-v5.5.5-esp32s2-${{ hashFiles('firmware/sdkconfig.defaults') }}
       - run: cargo build --release
-        working-directory: rust/firmware
+        working-directory: firmware
         env:
           WS_EXAMPLE_SECRETS: "1" # no real credentials in CI

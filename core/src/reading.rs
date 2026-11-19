@@ -1,5 +1,5 @@
-//! One observation and its 16-byte flash record. The byte layout is the same as
-//! the ESP8266 firmware's, so a queue dump reads the same on both.
+//! One observation and its 16-byte flash record. The byte layout is the one the
+//! station's former ESP8266 firmware (C++, in the git history) used.
 
 use crate::crc::crc16;
 
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn same_bytes_as_the_esp8266_firmware() {
-        // Encoded by lib/core/src/reading.cpp for this reading.
+        // Encoded by the ESP8266 firmware's lib/core/src/reading.cpp (git history) for this reading.
         let r =
             Reading { epoch: 300, temp_centi: -5, hum_centi: 10000, station_deci_pa: 992_000, source: SOURCE_BME280 };
         let b = encode(&r);
