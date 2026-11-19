@@ -12,7 +12,10 @@ on the host.
 | `firmware/` | The ESP32-S2 glue: Wi-Fi, SNTP, LittleFS, I2C, HTTPS, web server, OTA, RTC memory. |
 
 > **Status:** Builds for the ESP32-S2 (Rust 1.100.0.0 for Xtensa, ESP-IDF 5.5.5)
-> without warnings, and clippy is clean. Not yet run on hardware.
+> without warnings, and clippy is clean. Runs in the station since 2026-11-19
+> (in place of the ESP8266): measuring with the BME280, uploading, the LittleFS
+> queue, the status page and an update over Wi-Fi with confirmation work. The
+> SHT45 is not fitted; rollback and safe mode are not yet tried on hardware.
 
 ## Wiring
 
@@ -39,16 +42,44 @@ cd rust/firmware
 cargo build --release         # first build downloads ESP-IDF to ~/.espressif (~10 min)
 ```
 
+The first build sets up ESP-IDF's tools and Python environment. Two things can
+get in its way:
+
+- **Python newer than 3.13.** ESP-IDF 5.5 needs `tree_sitter`, which has no
+  wheel for Python 3.15; pip then compiles it and fails without the Python
+  headers. Put a Python 3.13 first on `PATH` for the build, e.g.
+  `uv python install 3.13` and a directory with a `python3` symlink to it.
+- **Slow GitHub downloads.** The tools (~575 MB) come from GitHub releases;
+  `export IDF_GITHUB_ASSETS=dl.espressif.com/github_assets` fetches them from
+  Espressif's mirror instead.
+
 **First flash over USB.** Hold **0**, press **RST**, release **0**; the board is
-then in download mode. Then:
+then in download mode. Flash with `esptool` (it comes with ESP-IDF):
 
 ```bash
-cargo run --release           # espflash: bootloader, partition table, app; then the console
+PY=~/.espressif/python_env/idf5.5_py3.13_env/bin/python   # the env the build created
+$PY ~/.espressif/esp-idf/v5.5.5/components/partition_table/gen_esp32part.py partitions.csv partitions.bin
+espflash save-image --chip esp32s2 target/xtensa-esp32s2-espidf/release/weather-station ws.bin
+head -c 8192 /dev/zero | tr '\0' '\377' > otadata.bin  # blank: boot ota_0
+$PY -m esptool --chip esp32s2 --port /dev/ttyACM0 --before no_reset write_flash \
+    0x1000 target/xtensa-esp32s2-espidf/release/bootloader.bin \
+    0x8000 partitions.bin 0xe000 otadata.bin 0x20000 ws.bin
 ```
 
-`espflash` also writes `partitions.csv` and the ESP-IDF bootloader, which has
-app rollback enabled. Press **RST** afterwards. The console runs over the S2's
-own USB (`espflash monitor`).
+This writes the ESP-IDF bootloader (which has app rollback enabled), the
+partition table from `partitions.csv`, a blank `otadata` and the app. Press
+**RST** afterwards: `esptool`'s own reset leaves the S2's USB in a state in
+which the app panics in a loop until a real reset.
+
+Not `cargo run --release` / `espflash` (4.7) over the S2's own USB: its flasher
+stub times out (`MemData`), and without the stub the ROM rejects its
+`EraseRegion` and `FlashEnd` commands. After each such failure the ROM loader
+stops answering until the next 0 + RST.
+
+**Logs.** The last lines of the log are at `http://<station>/log`. The USB
+console (`CONFIG_ESP_CONSOLE_USB_CDC`) did not enumerate on the first hardware
+run (`device descriptor read … error -71`), even after a power-on reset; not
+yet looked into.
 
 **Updates over Wi-Fi.**
 
@@ -56,6 +87,14 @@ own USB (`espflash monitor`).
 espflash save-image --chip esp32s2 target/xtensa-esp32s2-espidf/release/weather-station ws.bin
 tools/ota-s2.py 192.168.178.57 ws.bin          # password from ~/.config/homelab/weather-station/ota.pass
 ```
+
+The S2 replaced the ESP8266 in the station on 2026-11-19 and took over its
+address: the FRITZ!Box always gives 192.168.178.57 to the S2's MAC
+(`80:65:99:4d:c1:1a`). The ESP8266 used the same hostname, `weather-station`.
+
+`ota-s2.py` waits for the station to come back at the address it was given;
+if the update changes the address (as a new DHCP lease can), it reports
+"did not come back" although the update went through. Check the status page.
 
 The station hands out a one-time nonce (`GET /ota/nonce`). Before writing
 anything it checks an HMAC-SHA256 over the nonce, the image's SHA-256 and its
