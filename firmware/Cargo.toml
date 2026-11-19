@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Weather station firmware for the Wemos Lolin S2 mini (ESP32-S2)"
 publish = false
+license = "0BSD"
 
 [[bin]]
 name = "weather-station"

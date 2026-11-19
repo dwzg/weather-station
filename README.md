@@ -184,3 +184,8 @@ Rust firmware was written as its port to the ESP32-S2 and took over the station
 on 2026-11-19, with the same record format, upload rules and status page. The
 C++ firmware is in the git history up to commit `023749e`; `core/` still
 carries its test vectors (record bytes, queue tests).
+
+## License
+
+[0BSD](LICENSE): use, copy, modify and distribute it for any purpose, no
+attribution needed. The certificates in `certs/` are Let's Encrypt's.
