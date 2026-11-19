@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Updates the ESP32-S2 (Rust) station over Wi-Fi.
+"""Updates the station over Wi-Fi.
 
-    tools/ota-s2.py 192.168.178.57 rust/firmware/target/weather-station.bin
+    tools/ota.py <station-ip> ws.bin    (ws.bin: espflash save-image, see README)
 
 The password comes from $OTA_PASSWORD or ~/.config/homelab/weather-station/ota.pass.
 The station hands out a one-time nonce, checks an HMAC over the nonce and the
 image's SHA-256 before it writes anything, and the image against that hash
-before it boots it. See rust/core/src/ota.rs.
+before it boots it. See core/src/ota.rs.
 
 The new image boots unconfirmed and confirms itself once it has measured and
 the app has accepted a reading (up to ~10 min); if it resets before that, the
@@ -14,7 +14,7 @@ station goes back to the previous image. The tool waits for that verdict and
 exits 0 only when the new image is confirmed. With --no-wait it stops once the
 station runs the new image, still unconfirmed.
 
-    tools/ota-s2.py --self-test     prints the test vector shared with ota.rs
+    tools/ota.py --self-test     prints the test vector shared with ota.rs
 """
 import hashlib
 import hmac

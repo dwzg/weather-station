@@ -1,9 +1,8 @@
-.pio/
-include/secrets.h
 *.bin
 *.bin.gz
-rust/*/target/
-rust/firmware/.embuild/
-rust/firmware/secrets.env
-rust/firmware/sdkconfig
-rust/firmware/components_*.lock
+core/target/
+firmware/target/
+firmware/.embuild/
+firmware/secrets.env
+firmware/sdkconfig
+firmware/components_*.lock

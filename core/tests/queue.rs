@@ -1,4 +1,5 @@
-//! The queue tests of the ESP8266 firmware (test/test_core), ported one to one.
+//! The queue tests of the former ESP8266 firmware (test/test_core, in the git
+//! history), ported one to one.
 
 use ws_core::queue::{MemStore, ReadingQueue};
 use ws_core::reading::{Reading, RECORD_SIZE};

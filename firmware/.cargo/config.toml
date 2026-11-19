@@ -5,7 +5,7 @@ target = "xtensa-esp32s2-espidf"
 linker = "ldproxy"
 # The bootloader esp-idf-sys builds has app rollback enabled (sdkconfig.defaults);
 # espflash's built-in one may not. esp-idf-sys copies it next to the app.
-# Over the S2's own USB espflash fails; flash with esptool instead (../README.md).
+# Over the S2's own USB espflash fails; flash with esptool instead (README.md at the repository root).
 runner = "espflash flash --monitor --partition-table partitions.csv --bootloader target/xtensa-esp32s2-espidf/release/bootloader.bin"
 rustflags = ["--cfg", "espidf_time64"]
 
