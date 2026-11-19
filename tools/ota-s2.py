@@ -8,6 +8,12 @@ The station hands out a one-time nonce, checks an HMAC over the nonce and the
 image's SHA-256 before it writes anything, and the image against that hash
 before it boots it. See rust/core/src/ota.rs.
 
+The new image boots unconfirmed and confirms itself once it has measured and
+the app has accepted a reading (up to ~10 min); if it resets before that, the
+station goes back to the previous image. The tool waits for that verdict and
+exits 0 only when the new image is confirmed. With --no-wait it stops once the
+station runs the new image, still unconfirmed.
+
     tools/ota-s2.py --self-test     prints the test vector shared with ota.rs
 """
 import hashlib
@@ -34,10 +40,12 @@ def main() -> int:
     if sys.argv[1:] == ["--self-test"]:
         print(tag(key_from_password("pw"), "00112233445566778899aabbccddeeff", "0" * 64, 1234))
         return 0
-    if len(sys.argv) != 3:
+    no_wait = "--no-wait" in sys.argv[1:]
+    args = [a for a in sys.argv[1:] if a != "--no-wait"]
+    if len(args) != 2 or any(a.startswith("--") for a in args):
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    host, path = sys.argv[1], pathlib.Path(sys.argv[2])
+    host, path = args[0], pathlib.Path(args[1])
     pw = os.environ.get("OTA_PASSWORD")
     if not pw:
         pw = (pathlib.Path.home() / ".config/homelab/weather-station/ota.pass").read_text().strip()
@@ -56,7 +64,8 @@ def main() -> int:
             # The running image is unconfirmed: the station goes back to the
             # previous one, which can take the update.
             print("the running image is unconfirmed; the station returns to the previous one, then we retry")
-            if not wait_for_restart(host):
+            before = wait_for_restart(host, before)
+            if before is None:
                 return 1
             continue
         break
@@ -69,12 +78,47 @@ def main() -> int:
         print(f"refused: HTTP {code} {text}", file=sys.stderr)
         return 1
 
-    if not wait_for_restart(host):
+    after = wait_for_restart(host, before)
+    if after is None:
         return 1
-    after = status(host) or {}
-    print(f"{host} now runs {after.get('firmware', '?')}"
-          + (" (unconfirmed until it has measured and uploaded)" if after.get("ota", {}).get("unconfirmed") else ""))
-    return 0 if after.get("firmware") != before.get("firmware") or code == 200 else 1
+    # A freshly written image always boots unconfirmed. Confirmed right after
+    # the restart means the bootloader went back to the old one.
+    if not after.get("ota", {}).get("unconfirmed"):
+        print(f"{host} restarted but runs {after.get('firmware', '?')}, confirmed: "
+              "the new image did not boot (rolled back)", file=sys.stderr)
+        return 1
+    print(f"{host} now runs {after.get('firmware', '?')}, unconfirmed until it has measured and uploaded")
+    if no_wait:
+        return 0
+    return wait_for_confirmation(host, after)
+
+
+def restarted(s, prev):
+    """True if status `s` is from a later boot than status `prev`."""
+    return s.get("boot_count") != prev.get("boot_count") or s.get("uptime_s", 0) < prev.get("uptime_s", 0)
+
+
+def wait_for_confirmation(host, booted, seconds=900):
+    """Waits until the new image confirms itself (0) or the station restarts
+    before that, which rolls it back (1)."""
+    deadline = time.monotonic() + seconds
+    last = booted
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        s = status(host)
+        if s is None:
+            continue
+        if restarted(s, last):
+            print(f"{host} restarted before confirming; it now runs {s.get('firmware', '?')} "
+                  "(rolled back)", file=sys.stderr)
+            return 1
+        last = s
+        if not s.get("ota", {}).get("unconfirmed"):
+            print(f"{host} confirmed {s.get('firmware', '?')}")
+            return 0
+    print(f"{host} still unconfirmed after {seconds // 60} min "
+          f"(last error: {last.get('upload', {}).get('last_error') or 'none'})", file=sys.stderr)
+    return 1
 
 
 def status(host):
@@ -86,19 +130,21 @@ def status(host):
         return None
 
 
-def wait_for_restart(host, seconds=120):
-    """Waits until the station has gone away (it restarts about a second after
-    answering) and answers again."""
+def wait_for_restart(host, prev, seconds=180):
+    """Waits until the station answers from a later boot than status `prev`
+    and returns that status, or None. Judged by boot count and uptime, not by
+    the station going away: the restart can come late (after a running upload)
+    or so quickly that no poll misses it."""
     deadline = time.monotonic() + seconds
-    gone_by = time.monotonic() + 15
-    while time.monotonic() < gone_by and status(host) is not None:
-        time.sleep(0.5)
     while time.monotonic() < deadline:
-        if status(host) is not None:
-            return True
-        time.sleep(2)
-    print(f"{host} did not come back within {seconds} s", file=sys.stderr)
-    return False
+        s = status(host)
+        if s is not None:
+            if restarted(s, prev):
+                return s
+            prev = s
+        time.sleep(1)
+    print(f"{host} did not restart within {seconds} s (it may have a new address)", file=sys.stderr)
+    return None
 
 
 def send(host, image, sha, key):
