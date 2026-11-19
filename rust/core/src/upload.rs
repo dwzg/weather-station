@@ -18,7 +18,8 @@ pub struct Calibration {
 pub enum Outcome {
     /// Stored by the app: drop it from the queue.
     Accepted,
-    /// The app will never take this reading (400/422): drop it, or it blocks the queue.
+    /// The app will not take this reading (400, 422, other 4xx): drop it once the
+    /// app has taken the newest one (the uploader asks), or it blocks the queue.
     Rejected,
     /// Transient (network, 5xx, 429...): keep it, try again later.
     Retry,
@@ -34,7 +35,13 @@ pub fn classify_response(status: i32) -> Outcome {
         // Redirects (e.g. a trailing-slash 307), auth, wrong path or media type:
         // retrying cannot help, a person has to fix the URL, key or app.
         300..=399 | 401 | 403 | 404 | 405 | 413 | 415 => Outcome::Halt,
-        // No connection, TLS, timeout, 408, 429, 5xx, anything unexpected.
+        // Timeout and rate limit: the same request can succeed later.
+        408 | 429 => Outcome::Retry,
+        // Any other 4xx (409, 410, ...) is about this request; retrying the same
+        // reading forever would block the queue. The uploader drops it only if
+        // the app takes the newest reading, and halts if it refuses that too.
+        400..=499 => Outcome::Rejected,
+        // No connection, TLS, timeout, 5xx, anything unexpected.
         _ => Outcome::Retry,
     }
 }
@@ -135,6 +142,11 @@ mod tests {
         assert_eq!(classify_response(307), Outcome::Halt);
         assert_eq!(classify_response(413), Outcome::Halt);
         assert_eq!(classify_response(429), Outcome::Retry);
+        assert_eq!(classify_response(408), Outcome::Retry);
+        assert_eq!(classify_response(406), Outcome::Rejected);
+        assert_eq!(classify_response(409), Outcome::Rejected);
+        assert_eq!(classify_response(410), Outcome::Rejected);
+        assert_eq!(classify_response(499), Outcome::Rejected);
         assert_eq!(classify_response(502), Outcome::Retry);
         assert_eq!(classify_response(0), Outcome::Retry);
         assert_eq!(classify_response(-1), Outcome::Retry);
