@@ -1,0 +1,24 @@
+# Lolin S2 mini (ESP32-S2FN4R2): 4 MB flash, native USB.
+CONFIG_IDF_TARGET="esp32s2"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# partitions.csv is not set here: esp-idf-sys cannot use it; espflash writes it.
+
+# The board has no USB-serial chip: console and flashing over the S2's own USB.
+CONFIG_ESP_CONSOLE_USB_CDC=y
+
+# A new image runs "pending verify" until the firmware confirms it (first
+# accepted upload, or 10 min up with an empty queue); a reset before that
+# boots the previous image again.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=20000
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+CONFIG_LWIP_LOCAL_HOSTNAME="weather-station"
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+# OTA requests carry three extra headers.
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# Fewer metadata writes per append.
+CONFIG_LITTLEFS_USE_MTIME=n

@@ -1,7 +1,8 @@
 # Weather station firmware
 
 Firmware for the balcony weather station: a Wemos D1 mini (ESP8266) with a
-BME280, and optionally an SHT45. Every five minutes it takes a reading, keeps
+BME280, and optionally an SHT45. A port to the ESP32-S2 (Lolin S2 mini) in
+Rust is in [`rust/`](rust/README.md). Every five minutes it takes a reading, keeps
 it in flash, and sends it straight to the weather page
 ([dwzg/weatherpage](https://github.com/dwzg/weatherpage)) over HTTPS. A reading
 leaves the flash only after the page has confirmed it, so Wi-Fi or internet
@@ -40,8 +41,17 @@ pio device monitor                    # serial log, 115200 baud
 
 `lib/core` holds everything that is not hardware (queue, record format, time
 formatting, pressure, upload policy, backoff) and builds on the host; `src/`
-is the ESP8266 glue. Keep it that way: the planned ESP32-S2 (Rust) port reuses
-the same rules and test cases.
+is the ESP8266 glue. Keep it that way: the ESP32-S2 (Rust) port in
+[`rust/`](rust/README.md) follows the same rules and carries the same test
+cases, so a change to one belongs in the other too.
+
+## ESP32-S2 (Rust)
+
+[`rust/`](rust/README.md) holds the same firmware for a Wemos Lolin S2 mini,
+written in Rust on ESP-IDF. It keeps the record format, the 5-minute grid, the
+upload rules and the status page, and adds host tests for the BME280 driver and
+the upload policy, plus signed updates with automatic rollback. Build, flash
+and wiring are in its README.
 
 ## Pressure
 
