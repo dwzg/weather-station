@@ -136,10 +136,17 @@ bool ReadingQueue::front(Reading& out) {
     if (!store_.read(seg.id, cursorIdx_ * kRecordSize, rec, sizeof rec)) {
       // An I/O error says nothing about the data: stop here and let the caller
       // retry later. Skipping on it would walk the cursor through, and the next
-      // commit would delete, the whole backlog.
+      // commit would delete, the whole backlog. Only a record that keeps
+      // failing while what follows reads fine is skipped.
       ++readErrors_;
+      if (skipUnreadable(static_cast<size_t>(i))) {
+        i = cursorIndex();
+        if (i < 0) return false;
+        continue;
+      }
       return false;
     }
+    readFailValid_ = false;
     if (decodeReading(rec, out)) {
       frontValid_ = true;
       frontEpoch_ = out.epoch;
@@ -149,6 +156,54 @@ bool ReadingQueue::front(Reading& out) {
     ++cursorIdx_;
     dirty_ = true;
   }
+}
+
+bool ReadingQueue::readable(uint32_t id, uint32_t idx) {
+  uint8_t rec[kRecordSize];
+  return store_.read(id, idx * kRecordSize, rec, sizeof rec);
+}
+
+bool ReadingQueue::skipUnreadable(size_t i) {
+  const Seg seg = segs_[i];
+  if (readFailValid_ && readFailSeg_ == seg.id && readFailIdx_ == cursorIdx_) {
+    ++readFails_;
+  } else {
+    readFailValid_ = true;
+    readFailSeg_ = seg.id;
+    readFailIdx_ = cursorIdx_;
+    readFails_ = 1;
+  }
+  if (readFails_ < kReadFailsBeforeSkip) return false;
+  uint32_t skipped;
+  if (cursorIdx_ + 1 < seg.count && readable(seg.id, cursorIdx_ + 1)) {
+    skipped = 1;  // just this record
+    ++cursorIdx_;
+  } else if (i + 1 < segs_.size() && segs_[i + 1].count > 0 && readable(segs_[i + 1].id, 0)) {
+    skipped = seg.count - cursorIdx_;  // the rest of its segment
+    cursorSeg_ = segs_[i + 1].id;
+    cursorIdx_ = 0;
+  } else {
+    return false;  // nothing after it reads either: the store is down
+  }
+  unreadable_ += skipped;
+  readFailValid_ = false;
+  dirty_ = true;
+  return true;
+}
+
+bool ReadingQueue::newest(Reading& out) {
+  const int ci = cursorIndex();
+  if (ci < 0) return false;
+  for (int i = static_cast<int>(segs_.size()) - 1; i >= ci; --i) {
+    const Seg& seg = segs_[static_cast<size_t>(i)];
+    const uint32_t start = i == ci ? cursorIdx_ : 0;
+    for (uint32_t idx = seg.count; idx > start; --idx) {
+      uint8_t rec[kRecordSize];
+      if (!store_.read(seg.id, (idx - 1) * kRecordSize, rec, sizeof rec)) return false;
+      if (decodeReading(rec, out)) return true;
+    }
+  }
+  return false;
 }
 
 void ReadingQueue::pop() {

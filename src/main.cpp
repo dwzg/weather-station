@@ -175,6 +175,7 @@ void handleStatus() {
   jsonNum(s, "dropped_full", queue ? queue->dropped() : 0);
   jsonNum(s, "corrupt_skipped", queue ? queue->corrupt() : 0);
   jsonNum(s, "read_errors", queue ? queue->readErrors() : 0);
+  jsonNum(s, "unreadable_skipped", queue ? queue->unreadable() : 0);
   jsonNum(s, "write_errors", queueWriteErrors);
   jsonNum(s, "fs_used", fsUsed);
   jsonNum(s, "fs_total", fsTotal, false);
@@ -269,6 +270,15 @@ void measureIfDue() {
     failedAtMs = millis();
     return;
   }
+  // A value the weather app refuses is not queued: refusals are how the
+  // uploader recognises a broken app. Retried within the grace, then a gap.
+  if (!ws::appAccepts(r, {cfg::kAltitudeM, cfg::kPressureOffsetHpa})) {
+    logf("sensors: T=%d RH=%u p=%lu outside what the weather app accepts", r.tempCenti, r.humCenti,
+         static_cast<unsigned long>(r.stationDeciPa));
+    failedSlot = slot;
+    failedAtMs = millis();
+    return;
+  }
   lastSlot = slot;
   ++measured;
   lastReading = r;
@@ -288,6 +298,9 @@ void watchdogs() {
     saveRtc();
     logf("boot: stable, crash counter cleared");
   }
+  // Wi-Fi down for hours: the AP may be gone, or the SDK's Wi-Fi wedged. The
+  // queue is in flash and the clock in RTC memory, so a restart costs nothing.
+  if (!wifi.up() && up - wifi.stats().downSinceMs > cfg::kWifiDownRestartMs) restart("Wi-Fi down for 6 h");
   // Backlog, Wi-Fi up for a while, yet nothing accepted for hours: something in
   // the network stack is wedged. The queue is in flash and the clock in RTC
   // memory, so a restart costs nothing.

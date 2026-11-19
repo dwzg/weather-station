@@ -29,6 +29,13 @@ fn main() {
             .find(|(k, _)| k.trim() == key)
             .map(|(_, v)| v.trim().to_string())
             .unwrap_or_else(|| panic!("{file}: {key}= missing"));
+        // ESP-IDF's limits; a longer value would silently become an empty one.
+        let max = match key {
+            "WIFI_SSID" => 32,
+            "WIFI_PASS" => 64,
+            _ => usize::MAX,
+        };
+        assert!(value.len() <= max, "{file}: {key} is {} bytes, at most {max} fit", value.len());
         if key == "OTA_KEY" {
             assert!(
                 value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit()),

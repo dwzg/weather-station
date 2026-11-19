@@ -62,10 +62,16 @@ anything it checks an HMAC-SHA256 over the nonce, the image's SHA-256 and its
 length; before booting the image it checks the image against that SHA-256. The
 key is the SHA-256 of the OTA password; only the key is in the firmware.
 
-A new image boots in *pending verify*. It confirms itself with its first
-accepted upload, or after 10 minutes in normal mode with an empty queue. If it
-resets before that (a crash, a watchdog, or the 3-hour no-upload restart), the
-bootloader goes back to the previous image.
+A new image boots in *pending verify*. It confirms itself once it has measured
+and the app has accepted a reading. If it resets before that (a crash, a
+watchdog, the 3-hour no-upload or 6-hour no-Wi-Fi restart), the bootloader goes
+back to the previous image. ESP-IDF installs no update while the running image
+is unconfirmed, so an authenticated update to such an image first sends the
+station back to the previous one; `ota-s2.py` waits and sends the update again.
+Planned restarts wait while an update is being received.
+
+A start-up error (e.g. the Wi-Fi driver refusing to start) restarts the station
+and counts as a crash, so a persistent one ends in safe mode.
 
 ## Flash layout (`firmware/partitions.csv`)
 

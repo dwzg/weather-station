@@ -51,6 +51,17 @@ pub fn sea_level_centi_hpa(r: &Reading, cal: &Calibration) -> i32 {
     (p0 * 100.0).round() as i32
 }
 
+/// What the weather app accepts (dwzg/weatherpage, app/models.py: temperature
+/// -90..60 degC, humidity 0..100 %, sea-level pressure 800..1100 hPa), with the
+/// lower temperature bound at the sensors' -40 degC. A reading outside these is
+/// not queued: the app would refuse it, and a refused reading is how the
+/// station recognises a broken app.
+pub fn app_accepts(r: &Reading, cal: &Calibration) -> bool {
+    (-4000..=6000).contains(&i32::from(r.temp_centi))
+        && (0..=10_000).contains(&r.hum_centi)
+        && (80_000..=110_000).contains(&sea_level_centi_hpa(r, cal))
+}
+
 /// A signed fixed-point value with two decimals, e.g. -123 -> "-1.23".
 pub fn format_centi(v: i32) -> String {
     let a = v.unsigned_abs();
@@ -88,6 +99,20 @@ mod tests {
         );
         // 988.8 hPa at -0.05 degC, 100 %, 298 m (checked with the formula in Python).
         assert_eq!(p, "1026.12");
+    }
+
+    #[test]
+    fn app_ranges() {
+        let cal = Calibration { altitude_m: 298.0, pressure_offset_hpa: -3.2 };
+        let ok = Reading { epoch: 300, temp_centi: 1500, hum_centi: 5000, station_deci_pa: 980_000, source: 0 };
+        assert!(app_accepts(&ok, &cal));
+        assert!(app_accepts(&Reading { temp_centi: 6000, ..ok }, &cal));
+        assert!(!app_accepts(&Reading { temp_centi: 6001, ..ok }, &cal), "the sensor allows up to 85 degC");
+        assert!(!app_accepts(&Reading { temp_centi: -4001, ..ok }, &cal));
+        assert!(!app_accepts(&Reading { hum_centi: 10_001, ..ok }, &cal));
+        // 1070 hPa at the station is ~1106 hPa at sea level.
+        assert!(!app_accepts(&Reading { station_deci_pa: 1_070_000, ..ok }, &cal));
+        assert!(!app_accepts(&Reading { station_deci_pa: 760_000, ..ok }, &cal));
     }
 
     #[test]

@@ -207,3 +207,82 @@ fn ram_fallback_keeps_no_cursor() {
     let got = all(&mut q);
     assert_eq!(*got.last().unwrap(), 200 * 300);
 }
+
+// ---- unreadable records and newest() (not in the C++ suite before) ----------------------------
+
+use ws_core::queue::READ_FAILS_BEFORE_SKIP;
+
+/// Calls front() until it returns something, at most `tries` times.
+fn front_within(q: &mut ReadingQueue<MemStore>, tries: u32) -> (Option<u32>, u32) {
+    for n in 1..=tries {
+        if let Some(r) = q.front() {
+            return (Some(r.epoch), n);
+        }
+    }
+    (None, tries)
+}
+
+#[test]
+fn record_that_never_reads_is_skipped_after_retries() {
+    let mut q = new(4, 10);
+    for i in 1..=6 {
+        q.push(&mk(i * 300));
+    }
+    q.store_mut().fail_read_at.insert((1, RECORD_SIZE as u32)); // the second record
+    assert_eq!(drain(&mut q, 1), [300]);
+    // The first failures say nothing; the record is skipped only once the next one reads.
+    assert_eq!(front_within(&mut q, 10), (Some(900), READ_FAILS_BEFORE_SKIP));
+    assert_eq!(q.unreadable(), 1);
+    assert_eq!(all(&mut q), [900, 1200, 1500, 1800]);
+}
+
+#[test]
+fn unreadable_segment_is_skipped_when_the_next_reads() {
+    let mut q = new(4, 10);
+    for i in 1..=6 {
+        q.push(&mk(i * 300));
+    }
+    for k in 0..4 {
+        q.store_mut().fail_read_at.insert((1, k * RECORD_SIZE as u32));
+    }
+    assert_eq!(front_within(&mut q, 10), (Some(1500), READ_FAILS_BEFORE_SKIP));
+    assert_eq!(q.unreadable(), 4);
+    assert_eq!(all(&mut q), [1500, 1800]);
+    assert!(!q.store().segs.contains_key(&1), "the bad segment is deleted with the commit");
+}
+
+#[test]
+fn store_that_cannot_read_anything_loses_nothing() {
+    let mut q = new(4, 10);
+    for i in 1..=12 {
+        q.push(&mk(i * 300));
+    }
+    q.store_mut().fail_read = true;
+    assert_eq!(front_within(&mut q, 100).0, None);
+    q.commit();
+    assert_eq!((q.pending(), q.unreadable()), (12, 0));
+    q.store_mut().fail_read = false;
+    assert_eq!(all(&mut q).len(), 12);
+}
+
+#[test]
+fn newest_reading_leaves_the_cursor_alone() {
+    let mut q = new(4, 10);
+    assert!(q.newest().is_none());
+    for i in 1..=6 {
+        q.push(&mk(i * 300));
+    }
+    let f = q.front().unwrap();
+    assert_eq!(q.newest().unwrap().epoch, 1800);
+    q.pop(); // still pops what front() returned
+    assert_eq!(q.front().unwrap().epoch, 600);
+    assert_eq!(f.epoch, 300);
+    // A damaged last record: the one before it.
+    let last = q.store_mut().segs.get_mut(&2).unwrap();
+    let n = last.len();
+    last[n - 3] ^= 0xFF;
+    assert_eq!(q.newest().unwrap().epoch, 1500);
+    // Only pending readings count.
+    all(&mut q);
+    assert!(q.newest().is_none());
+}

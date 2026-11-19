@@ -10,7 +10,9 @@
 //! more than `max_segments` exist the oldest is dropped, so a long outage loses
 //! the oldest data rather than the newest, and the flash can never fill up.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use log::warn;
 
 use crate::crc::crc16;
 use crate::reading::{self, Reading, RECORD_SIZE};
@@ -60,6 +62,9 @@ impl<T: SegmentStore + ?Sized> SegmentStore for Box<T> {
 const CURSOR_MAGIC: [u8; 4] = *b"WSQ1";
 /// Cursor layout: magic[4] | segment u32 | index u32 | crc16 over bytes 0..11.
 const CURSOR_SIZE: usize = 14;
+/// Reads failing this often in a row at the same record make it a bad spot in
+/// the flash (if a later record can be read), not a store that is down.
+pub const READ_FAILS_BEFORE_SKIP: u32 = 5;
 
 #[derive(Clone, Copy, Debug)]
 struct Seg {
@@ -83,6 +88,10 @@ pub struct ReadingQueue<S: SegmentStore> {
     dropped: u32,
     corrupt: u32,
     read_errors: u32,
+    unreadable: u32,
+    /// Where reads last failed, and how often in a row.
+    read_fail_at: Option<(u32, u32)>,
+    read_fails: u32,
     front_epoch: u32,
     front_valid: bool,
     dirty: bool,
@@ -101,6 +110,9 @@ impl<S: SegmentStore> ReadingQueue<S> {
             dropped: 0,
             corrupt: 0,
             read_errors: 0,
+            unreadable: 0,
+            read_fail_at: None,
+            read_fails: 0,
             front_epoch: 0,
             front_valid: false,
             dirty: false,
@@ -249,10 +261,16 @@ impl<S: SegmentStore> ReadingQueue<S> {
             if !self.store.read(seg.id, self.cursor_idx * RECORD_SIZE as u32, &mut rec) {
                 // An I/O error says nothing about the data: stop here and let the
                 // caller retry later. Skipping on it would walk the cursor through,
-                // and the next commit would delete, the whole backlog.
+                // and the next commit would delete, the whole backlog. Only a
+                // record that keeps failing while later ones read fine is skipped.
                 self.read_errors += 1;
+                if self.skip_unreadable(i) {
+                    i = self.cursor_index()?;
+                    continue;
+                }
                 return None;
             }
+            self.read_fail_at = None;
             if let Some(r) = reading::decode(&rec) {
                 self.front_valid = true;
                 self.front_epoch = r.epoch;
@@ -263,6 +281,70 @@ impl<S: SegmentStore> ReadingQueue<S> {
             self.cursor_idx += 1;
             self.dirty = true;
         }
+    }
+
+    fn readable(&mut self, id: u32, idx: u32) -> bool {
+        let mut rec = [0u8; RECORD_SIZE];
+        self.store.read(id, idx * RECORD_SIZE as u32, &mut rec)
+    }
+
+    /// Called when the record at the cursor (in segment index `i`) cannot be
+    /// read. After READ_FAILS_BEFORE_SKIP failures in a row there, moves the
+    /// cursor past it, if what follows can be read: past the record if the next
+    /// one in its segment reads, past the rest of the segment if the next
+    /// segment does. If nothing after it reads either, the store itself is down
+    /// and nothing is skipped. True if the cursor moved.
+    fn skip_unreadable(&mut self, i: usize) -> bool {
+        let seg = self.segs[i];
+        let here = (seg.id, self.cursor_idx);
+        if self.read_fail_at == Some(here) {
+            self.read_fails += 1;
+        } else {
+            self.read_fail_at = Some(here);
+            self.read_fails = 1;
+        }
+        if self.read_fails < READ_FAILS_BEFORE_SKIP {
+            return false;
+        }
+        let skipped = if self.cursor_idx + 1 < seg.count && self.readable(seg.id, self.cursor_idx + 1) {
+            self.cursor_idx += 1;
+            1
+        } else if let Some(next) = self.segs.get(i + 1).copied().filter(|n| n.count > 0) {
+            if !self.readable(next.id, 0) {
+                return false;
+            }
+            let n = seg.count - self.cursor_idx;
+            self.cursor_seg = next.id;
+            self.cursor_idx = 0;
+            n
+        } else {
+            return false;
+        };
+        warn!("queue: {skipped} unreadable reading(s) in segment {:08x} skipped", seg.id);
+        self.unreadable += skipped;
+        self.read_fail_at = None;
+        self.dirty = true;
+        true
+    }
+
+    /// The newest pending reading, without moving the cursor or touching what
+    /// [`front`](Self::front) returned. None if there is none or it cannot be read.
+    pub fn newest(&mut self) -> Option<Reading> {
+        let ci = self.cursor_index()?;
+        for i in (ci..self.segs.len()).rev() {
+            let seg = self.segs[i];
+            let start = if i == ci { self.cursor_idx } else { 0 };
+            for idx in (start..seg.count).rev() {
+                let mut rec = [0u8; RECORD_SIZE];
+                if !self.store.read(seg.id, idx * RECORD_SIZE as u32, &mut rec) {
+                    return None;
+                }
+                if let Some(r) = reading::decode(&rec) {
+                    return Some(r);
+                }
+            }
+        }
+        None
     }
 
     /// Marks the reading [`front`](Self::front) returned as delivered.
@@ -315,6 +397,10 @@ impl<S: SegmentStore> ReadingQueue<S> {
     pub fn read_errors(&self) -> u32 {
         self.read_errors
     }
+    /// Readings skipped because their place in the flash could not be read.
+    pub fn unreadable(&self) -> u32 {
+        self.unreadable
+    }
     pub fn segments(&self) -> usize {
         self.segs.len()
     }
@@ -335,6 +421,8 @@ pub struct MemStore {
     pub persist_cursor: bool,
     pub fail_append: bool,
     pub fail_read: bool,
+    /// (segment, byte offset) of records whose reads fail.
+    pub fail_read_at: BTreeSet<(u32, u32)>,
     /// If > 0: the next append writes only this many bytes and fails.
     pub tear_append_at: usize,
 }
@@ -367,7 +455,7 @@ impl SegmentStore for MemStore {
         true
     }
     fn read(&mut self, id: u32, offset: u32, buf: &mut [u8]) -> bool {
-        if self.fail_read {
+        if self.fail_read || self.fail_read_at.contains(&(id, offset)) {
             return false;
         }
         let Some(v) = self.segs.get(&id) else { return false };

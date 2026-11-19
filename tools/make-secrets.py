@@ -28,6 +28,11 @@ def env(path):
 
 
 wifi = env(home / "weather-station" / "wifi.env")
+# Longer values do not fit the Wi-Fi drivers' fields and would be cut or emptied.
+if len(wifi["WIFI_SSID"].encode()) > 32:
+    raise SystemExit("WIFI_SSID is longer than 32 bytes")
+if not (8 <= len(wifi["WIFI_PASS"].encode()) <= 64 or wifi["WIFI_PASS"] == ""):
+    raise SystemExit("WIFI_PASS must be 8 to 64 bytes (or empty for an open network)")
 app = env(home / "stack-env" / "weatherpage.env")
 ota = (home / "weather-station" / "ota.pass").read_text().strip()
 

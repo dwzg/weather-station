@@ -64,16 +64,23 @@ impl WifiLink {
         pass: &'static str,
     ) -> anyhow::Result<Self> {
         let mut wifi = EspWifi::new(modem, sysloop, Some(nvs))?;
+        // The settings below improve things but are not needed to work: a
+        // failure is logged, not fatal.
+        let best_effort = |what: &str, err: sys::esp_err_t| {
+            if let Err(e) = sys::esp!(err) {
+                warn!("wifi: cannot set {what} ({e})");
+            }
+        };
         let host = CString::new(config::HOSTNAME)?;
         // SAFETY: the netif lives as long as `wifi`; the name is copied.
-        sys::esp!(unsafe { sys::esp_netif_set_hostname(wifi.sta_netif().handle(), host.as_ptr()) })?;
+        best_effort("hostname", unsafe { sys::esp_netif_set_hostname(wifi.sta_netif().handle(), host.as_ptr()) });
         // Never write credentials to flash on every join.
-        sys::esp!(unsafe { sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM) })?;
+        best_effort("RAM storage", unsafe { sys::esp_wifi_set_storage(sys::wifi_storage_t_WIFI_STORAGE_RAM) });
         wifi.set_configuration(&Configuration::Client(Self::client(ssid, pass, None)))?;
         wifi.start()?;
         // Mains powered: modem sleep only costs reliability.
-        sys::esp!(unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) })?;
-        sys::esp!(unsafe { sys::esp_wifi_set_max_tx_power(config::WIFI_TX_QUARTER_DBM) })?;
+        best_effort("power save off", unsafe { sys::esp_wifi_set_ps(sys::wifi_ps_type_t_WIFI_PS_NONE) });
+        best_effort("TX power", unsafe { sys::esp_wifi_set_max_tx_power(config::WIFI_TX_QUARTER_DBM) });
         let now = platform::millis();
         Ok(Self {
             wifi,
@@ -92,6 +99,7 @@ impl WifiLink {
 
     fn client(ssid: &str, pass: &str, ap: Option<([u8; 6], u8)>) -> ClientConfiguration {
         ClientConfiguration {
+            // build.rs checks the lengths (32 and 64 bytes), so these fit.
             ssid: ssid.try_into().unwrap_or_default(),
             password: pass.try_into().unwrap_or_default(),
             bssid: ap.map(|a| a.0),

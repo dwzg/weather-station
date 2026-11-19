@@ -29,7 +29,7 @@ use ws_core::queue::{MemStore, ReadingQueue, SegmentStore};
 use ws_core::reading::{Reading, SOURCE_SHT4X};
 use ws_core::sensors::Sensors;
 use ws_core::timefmt::TimeZone;
-use ws_core::upload::{format_centi, sea_level_centi_hpa, Calibration};
+use ws_core::upload::{app_accepts, format_centi, sea_level_centi_hpa, Calibration};
 use ws_core::uploader::{Env, UploadConfig, Uploader};
 
 use crate::bus::I2cBus;
@@ -137,8 +137,42 @@ impl Station {
         }
         self.rtc.intentional = 1; // not a crash
         self.save_rtc();
-        FreeRtos::delay_ms(100);
+        FreeRtos::delay_ms(500); // lets a last HTTP response leave
         platform::restart_now()
+    }
+
+    /// A restart the station chooses itself: never in the middle of an update.
+    fn planned_restart(&mut self, why: &str) {
+        if !web::ota_in_progress() {
+            self.restart(why);
+        }
+    }
+
+    /// An update is waiting for the previous image: return to it.
+    fn roll_back_for_update(&mut self) {
+        info!("ota: returning to the previous image, so the update can be installed there");
+        if let Some(q) = self.queue.as_mut() {
+            q.commit();
+        }
+        self.rtc.intentional = 1;
+        self.save_rtc();
+        FreeRtos::delay_ms(500);
+        // Only returns if there is no image to go back to.
+        let err = unsafe { sys::esp_ota_mark_app_invalid_rollback_and_reboot() };
+        let why = sys::EspError::from(err).map_or_else(|| "?".to_string(), |e| e.to_string());
+        warn!("ota: cannot roll back ({why}); confirming this image so the update can go in");
+        self.rtc.intentional = 0;
+        self.save_rtc();
+        self.confirm_image();
+        web::clear_rollback();
+    }
+
+    fn confirm_image(&mut self) {
+        self.ota_unconfirmed = false;
+        match sys::esp!(unsafe { sys::esp_ota_mark_app_valid_cancel_rollback() }) {
+            Ok(()) => info!("ota: new firmware confirmed"),
+            Err(e) => warn!("ota: could not confirm the firmware ({e})"),
+        }
     }
 
     fn measure_if_due(&mut self) {
@@ -153,7 +187,21 @@ impl Station {
             return; // retry every 10 s within the grace
         }
         let Some(bus) = self.bus.as_mut() else { return };
-        let Some(r) = self.sensors.measure(bus, &mut FreeRtos, slot, now_ms) else {
+        let measured = self.sensors.measure(bus, &mut FreeRtos, slot, now_ms);
+        // A value the weather app refuses is not queued: refusals are how the
+        // uploader recognises a broken app. Retried within the grace, then a gap.
+        let Some(r) = measured.filter(|r| {
+            let ok = app_accepts(r, &CAL);
+            if !ok {
+                warn!(
+                    "sensors: T={} RH={} p0={} is outside what the weather app accepts",
+                    format_centi(i32::from(r.temp_centi)),
+                    format_centi(i32::from(r.hum_centi)),
+                    format_centi(sea_level_centi_hpa(r, &CAL))
+                );
+            }
+            ok
+        }) else {
             self.failed_slot = slot;
             self.failed_at_ms = now_ms;
             return;
@@ -188,16 +236,14 @@ impl Station {
             info!("boot: stable, crash counter cleared");
         }
         let pending = self.queue.as_ref().map_or(0, |q| q.pending());
-        // A new image is confirmed once it has shown it can do its job.
-        if self.ota_unconfirmed
-            && (self.uploader.stats().accepted > 0
-                || (self.mode == Mode::Normal && up > config::STABLE_UPTIME_MS && pending == 0))
-        {
-            self.ota_unconfirmed = false;
-            match sys::esp!(unsafe { sys::esp_ota_mark_app_valid_cancel_rollback() }) {
-                Ok(()) => info!("ota: new firmware confirmed"),
-                Err(e) => warn!("ota: could not confirm the firmware ({e})"),
-            }
+        // A new image is confirmed once it has shown it can do its job: it has
+        // measured, and the app has accepted a reading from it.
+        if self.ota_unconfirmed && self.measured > 0 && self.uploader.stats().accepted > 0 {
+            self.confirm_image();
+        }
+        // Wi-Fi down for hours: the AP may be gone, or the radio driver wedged.
+        if !self.wifi.up() && up - self.wifi.stats().down_since_ms > config::WIFI_DOWN_RESTART_MS {
+            self.planned_restart("Wi-Fi down for 6 h");
         }
         // Backlog, Wi-Fi up for a while, yet nothing accepted for hours: something
         // in the network stack is wedged. The queue is in flash and the clock in
@@ -212,7 +258,7 @@ impl Station {
             let last_ok = self.uploader.stats().last_ok_epoch;
             let since = if last_ok > 0 { platform::epoch().saturating_sub(last_ok) } else { (up / 1000) as u32 };
             if since > config::NO_UPLOAD_RESTART_S {
-                self.restart("no upload accepted for 3 h despite Wi-Fi");
+                self.planned_restart("no upload accepted for 3 h despite Wi-Fi");
             }
         }
     }
@@ -285,6 +331,7 @@ impl Station {
             .raw("dropped_full", q.map_or(0, |q| q.dropped()))
             .raw("corrupt_skipped", q.map_or(0, |q| q.corrupt()))
             .raw("read_errors", q.map_or(0, |q| q.read_errors()))
+            .raw("unreadable_skipped", q.map_or(0, |q| q.unreadable()))
             .raw("write_errors", self.queue_write_errors)
             .raw("fs_used", fs.0)
             .raw("fs_total", fs.1)
@@ -312,19 +359,27 @@ impl Station {
     }
 }
 
-fn running_image_unconfirmed() -> bool {
-    let mut state: sys::esp_ota_img_states_t = 0;
-    // SAFETY: plain out-parameter; the running partition is static.
-    let ok =
-        unsafe { sys::esp_ota_get_state_partition(sys::esp_ota_get_running_partition(), &mut state) } == sys::ESP_OK;
-    ok && state == sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
-}
-
-fn main() -> anyhow::Result<()> {
+fn main() {
     sys::link_patches();
     let tz = TimeZone::parse(config::TIMEZONE).expect("valid time zone");
     logger::init(tz);
+    // run() only comes back with an error. Returning from main would end the
+    // task and leave the station idle, with no watchdog. Restart instead,
+    // counted as a crash, so a failure that persists ends in safe mode; wait
+    // longer the more often it failed.
+    let Err(e) = run(tz);
+    log::error!("boot: start-up failed: {e:#}");
+    let mut s = rtc::load().unwrap_or_default();
+    if platform::clock_valid() {
+        s.epoch = platform::epoch();
+    }
+    s.intentional = 0;
+    rtc::save(&s);
+    FreeRtos::delay_ms(5000 * s.crashes.clamp(1, 12));
+    platform::restart_now();
+}
 
+fn run(tz: TimeZone) -> anyhow::Result<std::convert::Infallible> {
     let (kind, reset_reason) = platform::reset_reason();
     let b = boot::on_boot(rtc::load(), kind, config::CRASHES_NO_UPLOAD, config::CRASHES_SAFE_MODE);
     rtc::save(&b.state);
@@ -407,7 +462,6 @@ fn main() -> anyhow::Result<()> {
         halt_ms: config::HALT_MS,
         stop_before_slot_s: config::STOP_BEFORE_SLOT_S,
         start_after_slot_s: config::START_AFTER_SLOT_S,
-        rejects_before_halt: config::REJECTS_BEFORE_HALT,
     });
 
     let mut st = Station {
@@ -428,7 +482,7 @@ fn main() -> anyhow::Result<()> {
         last_reading: None,
         uploader,
         wifi,
-        ota_unconfirmed: running_image_unconfirmed(),
+        ota_unconfirmed: platform::running_image_unconfirmed(),
     };
     if st.ota_unconfirmed {
         info!("ota: running a new image, confirming it once it uploads");
@@ -475,12 +529,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
         st.watchdogs();
-        if st.mode != Mode::Normal && platform::millis() > config::DEGRADED_MAX_MS {
+        if st.mode != Mode::Normal && platform::millis() > config::DEGRADED_MAX_MS && !web::ota_in_progress() {
             st.rtc.crashes = 0;
             st.restart("an hour in degraded mode, trying normal mode again");
         }
         if web::restart_requested() {
-            st.restart("firmware update installed");
+            st.planned_restart("firmware update installed"); // once the response is out
+        }
+        if web::rollback_requested() && !web::ota_in_progress() {
+            st.roll_back_for_update();
         }
         if platform::millis() - st.last_rtc_save_ms > config::RTC_SAVE_MS {
             st.save_rtc();

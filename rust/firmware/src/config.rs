@@ -48,7 +48,6 @@ pub const RETRY_MAX_MS: u32 = 10 * 60 * 1000;
 pub const HALT_MS: u32 = 30 * 60 * 1000; // after 401/403/404: someone has to fix the config
 pub const STOP_BEFORE_SLOT_S: u32 = 70;
 pub const START_AFTER_SLOT_S: u32 = 3;
-pub const REJECTS_BEFORE_HALT: u8 = 3;
 /// Don't start TLS below this much free heap (mbedTLS needs ~45 KB for a handshake).
 pub const TLS_MIN_FREE_HEAP: u32 = 60_000;
 pub const TLS_MIN_BLOCK: u32 = 20_000;
@@ -60,6 +59,9 @@ pub const CRASHES_SAFE_MODE: u32 = 5; // then: Wi-Fi, updates and status page on
 pub const DEGRADED_MAX_MS: u64 = 60 * 60 * 1000; // then try normal mode again
 pub const LOOP_STALL_MS: u64 = 180_000; // loop not run for this long: reset (worst batch ~80 s)
 pub const NO_UPLOAD_RESTART_S: u32 = 3 * 3600; // backlog, Wi-Fi up, nothing accepted
+/// Wi-Fi down this long: restart, in case the radio driver is wedged. The queue
+/// is in flash and ESP-IDF keeps the clock, so a restart costs nothing.
+pub const WIFI_DOWN_RESTART_MS: u64 = 6 * 3600 * 1000;
 pub const RTC_SAVE_MS: u64 = 5000;
 
 // Updates

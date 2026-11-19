@@ -90,6 +90,15 @@ pub fn reset_reason() -> (ResetKind, &'static str) {
     }
 }
 
+/// True while a freshly installed image waits to be confirmed (rollback armed).
+pub fn running_image_unconfirmed() -> bool {
+    let mut state: sys::esp_ota_img_states_t = 0;
+    // SAFETY: plain out-parameter; the running partition is static.
+    let ok =
+        unsafe { sys::esp_ota_get_state_partition(sys::esp_ota_get_running_partition(), &mut state) } == sys::ESP_OK;
+    ok && state == sys::esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+}
+
 pub fn restart_now() -> ! {
     unsafe { sys::esp_restart() }
 }

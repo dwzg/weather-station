@@ -5,6 +5,11 @@
 #include "queue.h"
 #include "upload.h"
 
+class HTTPClient;
+namespace BearSSL {
+class WiFiClientSecure;
+}
+
 struct UploadStats {
   uint32_t accepted = 0;
   uint32_t rejected = 0;
@@ -32,6 +37,9 @@ class Uploader {
  private:
   void sendBatch();
   void pause(uint32_t ms);
+  // After the app refused a reading: what does it say about the newest one?
+  enum class Probe { AppWorks, AppRefuses, NoAnswer };
+  Probe probe(HTTPClient& http, BearSSL::WiFiClientSecure& client, const ws::Reading& refused);
 
   ws::ReadingQueue* q_ = nullptr;
   ws::Calibration cal_{};
@@ -39,6 +47,5 @@ class Uploader {
   bool paused_ = false;      // elapsed-time form, safe across the 49-day millis() wrap
   uint32_t pausedAtMs_ = 0;
   uint32_t pauseMs_ = 0;
-  uint8_t rejectsInARow_ = 0;
   UploadStats st_;
 };

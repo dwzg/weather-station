@@ -8,6 +8,7 @@ use log::{info, warn};
 
 use crate::backoff::Backoff;
 use crate::queue::{ReadingQueue, SegmentStore};
+use crate::reading::Reading;
 use crate::timefmt::TimeZone;
 use crate::upload::{build_body, classify_response, Calibration, Outcome};
 
@@ -59,9 +60,6 @@ pub struct UploadConfig {
     /// its window.
     pub stop_before_slot_s: u32,
     pub start_after_slot_s: u32,
-    /// After this many rejected readings in a row the app is more likely broken
-    /// than the readings: stop dropping them and wait for a person.
-    pub rejects_before_halt: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,7 +79,6 @@ pub struct Uploader {
     cfg: UploadConfig,
     backoff: Backoff,
     paused_until_ms: Option<u64>,
-    rejects_in_a_row: u8,
     stats: UploadStats,
 }
 
@@ -92,7 +89,7 @@ fn clip(s: &str, n: usize) -> &str {
 impl Uploader {
     pub fn new(cfg: UploadConfig) -> Self {
         let backoff = Backoff::new(cfg.retry_min_ms, cfg.retry_max_ms);
-        Self { cfg, backoff, paused_until_ms: None, rejects_in_a_row: 0, stats: UploadStats::default() }
+        Self { cfg, backoff, paused_until_ms: None, stats: UploadStats::default() }
     }
 
     pub fn stats(&self) -> &UploadStats {
@@ -177,25 +174,40 @@ impl Uploader {
                 }
             };
             self.stats.last_status = resp.status;
-            let mut outcome = classify_response(i32::from(resp.status));
-            if outcome == Outcome::Rejected && self.rejects_in_a_row + 1 >= self.cfg.rejects_before_halt {
-                outcome = Outcome::Halt; // keep this one and everything behind it
-            }
-            match outcome {
+            match classify_response(i32::from(resp.status)) {
                 Outcome::Accepted => {
                     q.pop();
                     sent += 1;
                     self.stats.accepted += 1;
-                    self.rejects_in_a_row = 0;
                     self.stats.last_ok_epoch = env.epoch();
                     self.stats.last_error.clear();
                 }
-                Outcome::Rejected => {
-                    warn!("upload: app rejected {} -> {} {}", clip(&body, 90), resp.status, clip(&resp.body, 60));
-                    q.pop();
-                    self.stats.rejected += 1;
-                    self.rejects_in_a_row += 1;
-                }
+                // A refused reading is either bad data or a broken app (or a
+                // firmware sending a body the app no longer takes). Dropping it
+                // is right only in the first case: ask the app about another one.
+                Outcome::Rejected => match self.probe(q, t, &r, env) {
+                    Probe::AppWorks => {
+                        warn!(
+                            "upload: app rejected {} -> {} {}; it takes the newest reading, so this one goes",
+                            clip(&body, 90),
+                            resp.status,
+                            clip(&resp.body, 60)
+                        );
+                        q.pop();
+                        self.stats.rejected += 1;
+                    }
+                    Probe::AppRefuses => {
+                        self.stats.last_error =
+                            format!("HTTP {} {} (the newest reading too)", resp.status, clip(&resp.body, 40));
+                        halted = true;
+                        break;
+                    }
+                    Probe::NoAnswer(e) => {
+                        self.stats.last_error = e;
+                        failed = true;
+                        break;
+                    }
+                },
                 Outcome::Halt => {
                     self.stats.last_error =
                         format!("HTTP {} {}", resp.status, clip(&resp.body, 40)).trim_end().to_string();
@@ -242,6 +254,46 @@ impl Uploader {
             self.backoff.reset();
             if sent > 1 || q.pending() > 0 {
                 info!("upload: {sent} sent in {}ms, {} pending", now - started, q.pending());
+            }
+        }
+    }
+}
+
+/// What the app says about the newest reading after it refused an older one.
+enum Probe {
+    /// Accepted: the app works, the refused reading is bad.
+    AppWorks,
+    /// Refused too: the app (or what this firmware sends) is broken.
+    AppRefuses,
+    /// Could not tell (no answer, 5xx, or no other reading to ask about).
+    NoAnswer(String),
+}
+
+impl Uploader {
+    fn probe<S: SegmentStore, T: Transport>(
+        &mut self,
+        q: &mut ReadingQueue<S>,
+        t: &mut T,
+        refused: &Reading,
+        env: &impl Env,
+    ) -> Probe {
+        // The app upserts on the timestamp, so sending the newest reading early
+        // (it is sent again in its turn) does no harm.
+        let Some(newest) = q.newest().filter(|n| n.epoch != refused.epoch) else {
+            return Probe::NoAnswer("app refused the newest reading; waiting for a newer one".into());
+        };
+        match t.post(&build_body(&newest, &self.cfg.cal, &self.cfg.tz)) {
+            Err(e) => Probe::NoAnswer(e),
+            Ok(resp) => {
+                self.stats.last_status = resp.status;
+                match classify_response(i32::from(resp.status)) {
+                    Outcome::Accepted => {
+                        self.stats.last_ok_epoch = env.epoch();
+                        Probe::AppWorks
+                    }
+                    Outcome::Retry => Probe::NoAnswer(format!("HTTP {}", resp.status)),
+                    Outcome::Rejected | Outcome::Halt => Probe::AppRefuses,
+                }
             }
         }
     }
@@ -300,7 +352,6 @@ mod tests {
             halt_ms: 1_800_000,
             stop_before_slot_s: 70,
             start_after_slot_s: 3,
-            rejects_before_halt: 3,
         }
     }
 
@@ -410,15 +461,45 @@ mod tests {
     }
 
     #[test]
-    fn rejected_readings_are_dropped_until_three_in_a_row() {
-        let (mut u, mut q, mut env, ms) = setup(6);
-        let mut t = transport(&ms, vec![Ok(422), Ok(200), Ok(422), Ok(400), Ok(422)]);
+    fn rejected_reading_goes_when_the_app_takes_the_newest() {
+        let (mut u, mut q, mut env, ms) = setup(5);
+        // r1 refused, probe (r5) taken -> r1 dropped; r2 ok; r3 refused, probe taken; r4, r5 ok.
+        let mut t = transport(&ms, vec![Ok(422), Ok(200), Ok(200), Ok(422), Ok(201), Ok(200), Ok(200)]);
         u.poll(&mut q, true, &mut env, || Ok(&mut t));
-        // 422 dropped, 200 sent, 422 and 400 dropped, the third reject in a row halts.
-        assert_eq!(u.stats().rejected, 3);
-        assert_eq!(u.stats().accepted, 1);
-        assert_eq!(q.pending(), 2);
+        assert_eq!((u.stats().rejected, u.stats().accepted, q.pending()), (2, 3, 0));
+        assert_eq!(t.bodies.len(), 7);
+        assert_eq!(t.bodies[1], t.bodies[6], "the probe is the newest reading");
+        assert_eq!(t.bodies[4], t.bodies[6]);
+    }
+
+    #[test]
+    fn broken_app_loses_nothing() {
+        let (mut u, mut q, mut env, ms) = setup(5);
+        let mut t = transport(&ms, vec![Ok(422), Ok(422)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, q.pending()), (0, 5));
         assert_eq!(u.retry_in_ms(ms.get()), 1_800_000);
+        assert!(u.stats().last_error.contains("newest reading too"), "{}", u.stats().last_error);
+        // Still broken half an hour later: still nothing dropped.
+        ms.set(ms.get() + 1_800_000);
+        env.epoch0 -= 1800; // stay in the upload window
+        t.answers = vec![Ok(400), Ok(400)];
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((u.stats().rejected, q.pending(), t.bodies.len()), (0, 5, 4));
+    }
+
+    #[test]
+    fn refused_newest_reading_waits_for_a_newer_one() {
+        let (mut u, mut q, mut env, ms) = setup(1);
+        let mut t = transport(&ms, vec![Ok(422)]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((q.pending(), t.bodies.len()), (1, 1), "nothing to ask about, nothing dropped");
+        assert!(u.retry_in_ms(ms.get()) < 1_800_000, "a short wait, not a halt");
+        // The probe itself gets no answer: keep, retry.
+        let (mut u, mut q, mut env, ms) = setup(3);
+        let mut t = transport(&ms, vec![Ok(422), Err("timeout".into())]);
+        u.poll(&mut q, true, &mut env, || Ok(&mut t));
+        assert_eq!((q.pending(), u.stats().last_error.as_str()), (3, "timeout"));
     }
 
     #[test]

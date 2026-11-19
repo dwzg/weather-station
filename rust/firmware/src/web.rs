@@ -22,6 +22,7 @@ static STATUS: Mutex<String> = Mutex::new(String::new());
 static NONCES: Mutex<Nonces> = Mutex::new(Nonces::new(config::OTA_NONCE_TTL_MS));
 static OTA_BUSY: AtomicBool = AtomicBool::new(false);
 static RESTART_FOR_UPDATE: AtomicBool = AtomicBool::new(false);
+static ROLLBACK_FOR_UPDATE: AtomicBool = AtomicBool::new(false);
 /// Biggest image an app slot takes (partitions.csv).
 const MAX_IMAGE: usize = 0x18_0000;
 
@@ -33,6 +34,16 @@ pub fn set_status(json: String) {
 /// An update was written and activated: commit, then restart.
 pub fn restart_requested() -> bool {
     RESTART_FOR_UPDATE.load(Ordering::Relaxed)
+}
+
+/// An authenticated update arrived while the running image is unconfirmed:
+/// go back to the previous image, so the update can be installed there.
+pub fn rollback_requested() -> bool {
+    ROLLBACK_FOR_UPDATE.load(Ordering::Relaxed)
+}
+
+pub fn clear_rollback() {
+    ROLLBACK_FOR_UPDATE.store(false, Ordering::Relaxed);
 }
 
 pub fn ota_in_progress() -> bool {
@@ -89,6 +100,12 @@ pub fn start(ota_key: Key) -> anyhow::Result<EspHttpServer<'static>> {
         }
         if len == 0 || len > MAX_IMAGE {
             return refuse(req, 413, "image size");
+        }
+        if platform::running_image_unconfirmed() {
+            // ESP-IDF writes no new image while the running one is unconfirmed.
+            // Return to the previous, confirmed image; the updater retries there.
+            ROLLBACK_FOR_UPDATE.store(true, Ordering::Release);
+            return refuse(req, 409, "rollback: this image is unconfirmed, returning to the previous one; retry then");
         }
 
         info!("ota: receiving {len} bytes");
