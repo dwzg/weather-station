@@ -11,10 +11,8 @@ on the host.
 | `core/` | `ws-core`: everything that is not hardware — queue and record format, POSIX time zones, pressure, upload policy and batching, BME280/SHT4x drivers (over `embedded-hal`), crash counting, OTA authentication. `cargo test` on any machine. |
 | `firmware/` | The ESP32-S2 glue: Wi-Fi, SNTP, LittleFS, I2C, HTTPS, web server, OTA, RTC memory. |
 
-> **Status:** Not yet built for the S2 or run on hardware. The `rust-firmware` CI
-> job builds it for the S2. The core is tested on the host. The firmware has been
-> compiled and linked against ESP-IDF 5.5.5 for an ESP32-C3, with only the pins
-> swapped and no warnings, to check it against the real ESP-IDF APIs.
+> **Status:** Builds for the ESP32-S2 (Rust 1.100.0.0 for Xtensa, ESP-IDF 5.5.5)
+> without warnings, and clippy is clean. Not yet run on hardware.
 
 ## Wiring
 
@@ -73,7 +71,7 @@ bootloader goes back to the previous image.
 
 | | |
 | --- | --- |
-| `ota_0`, `ota_1` | 1.5 MB each. The app is about 1.3 MB. |
+| `ota_0`, `ota_1` | 1.5 MB each. The app is 1.18 MB (75 %). |
 | `storage` | 896 KB LittleFS for the queue. 60 days need 120 of its 224 blocks. |
 
 ## Differences from the ESP8266 firmware
